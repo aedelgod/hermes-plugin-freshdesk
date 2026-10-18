@@ -1,0 +1,72 @@
+# Freshdesk connector for Hermes Agent
+
+**Author:** GFORGOV®. Copyright (c) 2026 GFORGOV®. Released under the MIT License.
+
+A dependency-free directory plugin that exposes Freshdesk API v2 tools to Hermes
+Agent. It performs bounded pagination, bounded downloads, strict origin checks,
+and exact readback verification of every write. The connector is generic: it
+carries no tenant configuration, credentials, or ticket data.
+
+## Included tools
+
+- `freshdesk_list_tickets` — bounded ticket pagination with `updated_since` and an `include_description` option. Returns `truncated` rather than discarding pages when the page cap is reached.
+- `freshdesk_get_ticket` — fetch one ticket by ID.
+- `freshdesk_search_tickets` — read-only search by `status` (2-5) and/or `priority` (1-4). At least one filter is required; the query is built and URL-encoded by the client.
+- `freshdesk_list_conversations` — fetch a bounded complete conversation list.
+- `freshdesk_get_contact` — fetch one contact by ID.
+- `freshdesk_download_attachment` — resolve an attachment by ticket and attachment ID, then download it from the Freshdesk CDN/S3 origin to the Hermes cache. No caller-controlled URL.
+- `freshdesk_add_private_note` — write a plain-text private note (HTML-escaped), then verify it through conversations.
+- `freshdesk_create_ticket` — create a basic ticket, then verify every submitted field by fetching the new ticket.
+
+The two write tools (`freshdesk_add_private_note` and `freshdesk_create_ticket`) register a `pre_tool_call` hook that escalates execution to Hermes' trusted human-approval gate. The language model cannot satisfy this gate with an ordinary tool argument, and unattended contexts without an approval bridge fail closed.
+
+## Configuration
+
+Provide credentials and account identity as profile secrets named exactly as the
+plugin declares:
+
+```
+FRESHDESK_DOMAIN=your-account
+FRESHDESK_API_KEY=your-api-key
+```
+
+`FRESHDESK_DOMAIN` accepts either `your-account` or `https://your-account.freshdesk.com`. Custom support CNAMEs are rejected because credentials must only be sent to a native Freshdesk HTTPS origin. The plugin reads these through Hermes' profile secret scope, so they are never read directly from the process environment by plugin code.
+
+## Install as a user plugin
+
+Copy this directory into the active Hermes profile:
+
+```bash
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+mkdir -p "$HERMES_HOME/plugins"
+cp -R . "$HERMES_HOME/plugins/freshdesk"
+```
+
+Restart the relevant Hermes process so plugin discovery runs again.
+
+## Tests
+
+The suite uses an injected fake HTTP transport and never contacts a live server:
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+## Security properties
+
+- Native `https://<account>.freshdesk.com` account origins only.
+- Basic-auth credentials are never placed in URLs or tool results.
+- Redirects are rejected.
+- Response bodies and attachment downloads are bounded while being read.
+- Attachment downloads are resolved only from a ticket's own attachment objects (the ticket, then its conversations); no caller-supplied URL is ever fetched.
+- Attachment URLs are accepted only from Freshdesk's same-origin attachment path (`/helpdesk/attachments/`), `attachment.freshdesk.com`, hosts matching `[a-z0-9-]+-attachment.freshdesk.com`, `s3.amazonaws.com/cdn.freshdesk.com/`, and `cdn.freshdesk.com.s3*.amazonaws.com`. Dummy signatures on any other S3 bucket are rejected.
+- The Freshdesk Authorization header is sent only to the same-origin attachment path; it is never sent to the Freshdesk CDN or to S3.
+- Attachment filenames are reduced to their basename, created mode `0600`, exclusively and without following symlinks, inside a directory opened component-by-component without symlink traversal.
+- Write tools pass through Hermes' human-approval gate and are read back before success is returned.
+- No automatic retries of POST requests. Ambiguous writes return `state=write_may_have_succeeded` with `created_id` when known and `retry_safe=false`; definite rejections (HTTP 400/401/403/404/409/422) return a plain failure.
+
+## Deliberate field limits
+
+- `freshdesk_download_attachment` takes only `ticket_id` and `attachment_id`; the URL is always derived from Freshdesk.
+- `freshdesk_create_ticket` accepts only `subject`, `description`, `priority`, `status`, and exactly one of `email` or `requester_id`.
+- `freshdesk_search_tickets` accepts only `status` and `priority`; it never accepts a raw query string.
