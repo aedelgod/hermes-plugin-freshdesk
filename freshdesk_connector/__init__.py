@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -58,41 +59,213 @@ def _result(call: Callable[[], Any]) -> str:
         return json.dumps({"success": False, "error": str(exc), "error_type": type(exc).__name__})
 
 
-def _approval_hook(tool_name: str, args: dict | None = None, **_: Any):
-    if tool_name == "freshdesk_add_private_note":
-        ticket = (args or {}).get("ticket_id", "unknown")
-        return {
-            "action": "approve",
-            "message": f"Add a private note to Freshdesk ticket {ticket}",
-        }
+_STATUS_LABELS = {2: "Open", 3: "Pending", 4: "Resolved", 5: "Closed"}
+_PRIORITY_LABELS = {1: "Low", 2: "Medium", 3: "High", 4: "Urgent"}
+
+
+def _status_label(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"{value} unrecognized"
+    if value in _STATUS_LABELS:
+        return f"{_STATUS_LABELS[value]} ({value})"
+    return f"{value} unrecognized"
+
+
+def _priority_label(value: object) -> str:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"{value} unrecognized"
+    if value in _PRIORITY_LABELS:
+        return f"{_PRIORITY_LABELS[value]} ({value})"
+    return f"{value} unrecognized"
+
+
+def _excerpt(value: object, limit: int = 100) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = " ".join(value.split())
+    if len(cleaned) > limit:
+        return cleaned[: max(0, limit - 3)] + "..."
+    return cleaned
+
+
+def _preview_ticket(ticket_id: object):
+    """Return ``{subject, status, priority}`` for a ticket, or ``None``.
+
+    The default implementation reads through ``_client().get_ticket``. Tests may
+    monkeypatch this function to avoid the network. Any failure (missing
+    credentials, transport error, malformed response) is swallowed so a broken
+    preview never blocks the approval prompt.
+    """
+    try:
+        ticket = _client().get_ticket(ticket_id)
+    except Exception:
+        return None
+    if not isinstance(ticket, dict):
+        return None
+    return {
+        "subject": ticket.get("subject"),
+        "status": ticket.get("status"),
+        "priority": ticket.get("priority"),
+    }
+
+
+def _format_from_to(label: str, current: object, proposed: object, label_fn) -> str:
+    current_text = "current value unavailable" if current is None else label_fn(current)
+    return f"{label}: {current_text} -> {label_fn(proposed)}"
+
+
+def _truncate_message(message: str, limit: int = 450) -> str:
+    if len(message) <= limit:
+        return message
+    return message[: max(0, limit - 3)] + "..."
+
+
+def _approval_relevant_args(tool_name: str, args: dict) -> dict:
+    args = args or {}
     if tool_name == "freshdesk_create_ticket":
-        return {
-            "action": "approve",
-            "message": "Create a new Freshdesk ticket",
-        }
-    if tool_name == "freshdesk_reply_to_ticket":
-        ticket = (args or {}).get("ticket_id", "unknown")
-        return {
-            "action": "approve",
-            "message": f"Send a public reply to the requester of Freshdesk ticket {ticket}",
-        }
-    if tool_name == "freshdesk_add_time_entry":
-        ticket = (args or {}).get("ticket_id", "unknown")
-        duration = (args or {}).get("time_spent", "unknown")
-        billable = (args or {}).get("billable", "unknown")
-        return {
-            "action": "approve",
-            "message": f"Add time entry of {duration} to Freshdesk ticket {ticket} (billable: {billable})",
-        }
-    if tool_name == "freshdesk_update_ticket":
-        ticket = (args or {}).get("ticket_id", "unknown")
-        fields = sorted(k for k in (args or {}) if k in ("status", "priority"))
-        field_text = ", ".join(fields) if fields else "no fields"
-        return {
-            "action": "approve",
-            "message": f"Update Freshdesk ticket {ticket}: {field_text}",
-        }
-    return None
+        src = args.get("fields") if isinstance(args.get("fields"), dict) else {}
+    else:
+        src = args
+    return {
+        "tool": tool_name,
+        "ticket_id": src.get("ticket_id"),
+        "body": src.get("body"),
+        "subject": src.get("subject"),
+        "description": src.get("description"),
+        "email": src.get("email"),
+        "requester_id": src.get("requester_id"),
+        "status": src.get("status"),
+        "priority": src.get("priority"),
+        "time_spent": src.get("time_spent"),
+        "billable": src.get("billable"),
+        "note": src.get("note"),
+        "agent_id": src.get("agent_id"),
+    }
+
+
+def _rule_key(tool_name: str, args: dict) -> str:
+    payload = _approval_relevant_args(tool_name, args)
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return f"{tool_name}:{digest[:16]}"
+
+
+def _approval_message_update_ticket(args: dict) -> str:
+    ticket_id = args.get("ticket_id")
+    current = _preview_ticket(ticket_id)
+    subject = _excerpt(current.get("subject")) if current else ""
+    header = f"Update Freshdesk ticket {ticket_id}"
+    if subject:
+        header = f"{header}: {subject}"
+    lines = [header]
+    if "status" in args:
+        cur = current.get("status") if current else None
+        lines.append(_format_from_to("status", cur, args["status"], _status_label))
+    if "priority" in args:
+        cur = current.get("priority") if current else None
+        lines.append(_format_from_to("priority", cur, args["priority"], _priority_label))
+    return "\n".join(lines)
+
+
+def _approval_message_add_private_note(args: dict) -> str:
+    ticket_id = args.get("ticket_id")
+    body = args.get("body")
+    current = _preview_ticket(ticket_id)
+    subject = _excerpt(current.get("subject")) if current else ""
+    header = f"Add a private note to Freshdesk ticket {ticket_id}"
+    if subject:
+        header = f"{header}: {subject}"
+    lines = [header]
+    if isinstance(body, str) and body.strip():
+        lines.append(f"Note: {_excerpt(body)}")
+    return "\n".join(lines)
+
+
+def _approval_message_reply_to_ticket(args: dict) -> str:
+    ticket_id = args.get("ticket_id")
+    body = args.get("body")
+    current = _preview_ticket(ticket_id)
+    subject = _excerpt(current.get("subject")) if current else ""
+    header = f"Freshdesk public reply to ticket {ticket_id}"
+    if subject:
+        header = f"{header}: {subject}"
+    lines = [header, "This emails the requester."]
+    if isinstance(body, str) and body.strip():
+        lines.append(f"Body: {_excerpt(body)}")
+    return "\n".join(lines)
+
+
+def _approval_message_create_ticket(args: dict) -> str:
+    fields = args.get("fields") if isinstance(args.get("fields"), dict) else {}
+    subject = _excerpt(fields.get("subject"))
+    description = _excerpt(fields.get("description"))
+    status = fields.get("status")
+    priority = fields.get("priority")
+    email = fields.get("email")
+    requester_id = fields.get("requester_id")
+    lines = ["Create a new Freshdesk ticket"]
+    if subject:
+        lines.append(f"Subject: {subject}")
+    if email:
+        lines.append(f"Requester (email): {email}")
+    if requester_id is not None:
+        lines.append(f"Requester (id): {requester_id}")
+    if status is not None:
+        lines.append(f"Status: {_status_label(status)}")
+    if priority is not None:
+        lines.append(f"Priority: {_priority_label(priority)}")
+    if description:
+        lines.append(f"Description: {description}")
+    return "\n".join(lines)
+
+
+def _approval_message_add_time_entry(args: dict) -> str:
+    ticket_id = args.get("ticket_id")
+    time_spent = args.get("time_spent")
+    billable = args.get("billable")
+    note = args.get("note")
+    agent_id = args.get("agent_id")
+    current = _preview_ticket(ticket_id)
+    subject = _excerpt(current.get("subject")) if current else ""
+    header = f"Freshdesk time entry for ticket {ticket_id}"
+    if subject:
+        header = f"{header}: {subject}"
+    lines = [header]
+    if time_spent is not None:
+        lines.append(f"Duration: {time_spent}")
+    if billable is not None:
+        lines.append(f"Billable: {'yes' if billable else 'no'}")
+    if isinstance(note, str) and note.strip():
+        lines.append(f"Note: {_excerpt(note)}")
+    if agent_id is not None:
+        lines.append(f"Agent: {agent_id}")
+    return "\n".join(lines)
+
+
+_APPROVAL_MESSAGES = {
+    "freshdesk_add_private_note": _approval_message_add_private_note,
+    "freshdesk_create_ticket": _approval_message_create_ticket,
+    "freshdesk_reply_to_ticket": _approval_message_reply_to_ticket,
+    "freshdesk_add_time_entry": _approval_message_add_time_entry,
+    "freshdesk_update_ticket": _approval_message_update_ticket,
+}
+
+
+def _approval_hook(tool_name: str, args: dict | None = None, **_: Any):
+    builder = _APPROVAL_MESSAGES.get(tool_name)
+    if builder is None:
+        return None
+    args = args or {}
+    try:
+        message = builder(args)
+    except Exception:
+        message = f"Approve {tool_name}"
+    return {
+        "action": "approve",
+        "message": _truncate_message(message),
+        "rule_key": _rule_key(tool_name, args),
+    }
 
 
 def _list_tickets(args: dict, **_: Any) -> str:

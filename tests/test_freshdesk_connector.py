@@ -4,6 +4,7 @@ import os
 import stat
 import tempfile
 import unittest
+from unittest import mock
 import urllib.parse
 from pathlib import Path
 
@@ -816,6 +817,214 @@ class HandlerResultTests(unittest.TestCase):
                 data = json.loads(result)
                 self.assertFalse(data["success"])
                 self.assertIn("does not accept", data["error"])
+
+
+class ApprovalHookTests(unittest.TestCase):
+    def _hook(self, tool_name, args=None):
+        return freshdesk_connector._approval_hook(tool_name, args or {})
+
+    def test_read_tools_return_none_and_write_tools_approve(self):
+        for name, args in (
+            ("freshdesk_list_tickets", {}),
+            ("freshdesk_get_ticket", {"ticket_id": 7}),
+            ("freshdesk_search_tickets", {"tag": "x"}),
+            ("freshdesk_list_conversations", {"ticket_id": 7}),
+            ("freshdesk_get_contact", {"contact_id": 7}),
+            ("freshdesk_download_attachment", {"ticket_id": 7, "attachment_id": 1}),
+        ):
+            with self.subTest(name=name):
+                self.assertIsNone(self._hook(name, args))
+
+    def test_update_shows_current_and_proposed_status_and_priority_with_labels(self):
+        current = {"subject": "Login broken for customer", "status": 3, "priority": 2}
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: current):
+            directive = self._hook(
+                "freshdesk_update_ticket", {"ticket_id": 51257, "status": 2, "priority": 3}
+            )
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("Update Freshdesk ticket 51257", directive["message"])
+        self.assertIn("Login broken for customer", directive["message"])
+        self.assertIn("status: Pending (3) -> Open (2)", directive["message"])
+        self.assertIn("priority: Medium (2) -> High (3)", directive["message"])
+
+    def test_update_unknown_status_shows_unrecognized_label(self):
+        current = {"subject": "S", "status": 99, "priority": 2}
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: current):
+            directive = self._hook(
+                "freshdesk_update_ticket", {"ticket_id": 7, "status": 2, "priority": 4}
+            )
+        self.assertIn("status: 99 unrecognized -> Open (2)", directive["message"])
+        self.assertIn("priority: Medium (2) -> Urgent (4)", directive["message"])
+
+    def test_update_failed_preview_says_current_value_unavailable(self):
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: None):
+            directive = self._hook("freshdesk_update_ticket", {"ticket_id": 7, "status": 2})
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("Update Freshdesk ticket 7", directive["message"])
+        self.assertIn("current value unavailable", directive["message"])
+        self.assertIn("status: current value unavailable -> Open (2)", directive["message"])
+
+    def test_update_only_shows_from_to_for_fields_present(self):
+        current = {"subject": "S", "status": 3, "priority": 2}
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: current):
+            directive = self._hook("freshdesk_update_ticket", {"ticket_id": 7, "priority": 1})
+        self.assertIn("priority: Medium (2) -> Low (1)", directive["message"])
+        self.assertNotIn("status:", directive["message"])
+
+    def test_private_note_message_includes_ticket_subject_and_body(self):
+        current = {"subject": "Need help", "status": 2, "priority": 3}
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: current):
+            directive = self._hook(
+                "freshdesk_add_private_note", {"ticket_id": 7, "body": "Internal context for the agent"}
+            )
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("private note", directive["message"])
+        self.assertIn("Freshdesk ticket 7", directive["message"])
+        self.assertIn("Need help", directive["message"])
+        self.assertIn("Internal context for the agent", directive["message"])
+
+    def test_public_reply_message_includes_body_and_emails_requester(self):
+        current = {"subject": "Reply me", "status": 2, "priority": 3}
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: current):
+            directive = self._hook(
+                "freshdesk_reply_to_ticket", {"ticket_id": 7, "body": "Here is the public answer"}
+            )
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("public reply", directive["message"])
+        self.assertIn("ticket 7", directive["message"])
+        self.assertIn("Reply me", directive["message"])
+        self.assertIn("emails the requester", directive["message"])
+        self.assertIn("Here is the public answer", directive["message"])
+
+    def test_create_message_includes_subject_and_requester_email(self):
+        fields = {
+            "subject": "New issue", "description": "It broke", "priority": 3,
+            "status": 2, "email": "user@example.com",
+        }
+        directive = self._hook("freshdesk_create_ticket", {"fields": fields})
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("Create a new Freshdesk ticket", directive["message"])
+        self.assertIn("New issue", directive["message"])
+        self.assertIn("user@example.com", directive["message"])
+        self.assertIn("High (3)", directive["message"])
+        self.assertIn("Open (2)", directive["message"])
+
+    def test_create_message_shows_requester_id_when_no_email(self):
+        fields = {
+            "subject": "New issue", "description": "It broke", "priority": 4,
+            "status": 4, "requester_id": 42,
+        }
+        directive = self._hook("freshdesk_create_ticket", {"fields": fields})
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("Subject: New issue", directive["message"])
+        self.assertIn("Requester (id): 42", directive["message"])
+        self.assertNotIn("Requester (email)", directive["message"])
+        self.assertIn("Urgent (4)", directive["message"])
+
+    def test_time_entry_message_includes_duration_note_billable_and_agent(self):
+        current = {"subject": "Ticket subject", "status": 2, "priority": 3}
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: current):
+            directive = self._hook(
+                "freshdesk_add_time_entry",
+                {"ticket_id": 7, "time_spent": "02:30", "note": "Did work", "billable": True, "agent_id": 5},
+            )
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("time entry", directive["message"])
+        self.assertIn("ticket 7", directive["message"])
+        self.assertIn("Ticket subject", directive["message"])
+        self.assertIn("Duration: 02:30", directive["message"])
+        self.assertIn("Did work", directive["message"])
+        self.assertIn("Billable: yes", directive["message"])
+        self.assertIn("Agent: 5", directive["message"])
+
+    def test_time_entry_omits_agent_id_and_note_when_not_set(self):
+        current = {"subject": "S", "status": 2, "priority": 3}
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: current):
+            directive = self._hook(
+                "freshdesk_add_time_entry",
+                {"ticket_id": 7, "time_spent": "01:00", "billable": False},
+            )
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("time entry", directive["message"])
+        self.assertIn("Duration: 01:00", directive["message"])
+        self.assertIn("Billable: no", directive["message"])
+        self.assertNotIn("Agent:", directive["message"])
+        self.assertNotIn("Note:", directive["message"])
+
+    def test_message_is_at_most_450_chars_when_body_is_long(self):
+        current = {"subject": "S", "status": 2, "priority": 3}
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: current):
+            directive = self._hook(
+                "freshdesk_reply_to_ticket", {"ticket_id": 7, "body": "x" * 5000}
+            )
+        self.assertEqual(directive["action"], "approve")
+        self.assertLessEqual(len(directive["message"]), 450)
+        self.assertIn("public reply", directive["message"])
+
+    def test_message_is_at_most_450_chars_when_subject_and_note_are_long(self):
+        current = {"subject": "x" * 2000, "status": 3, "priority": 2}
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: current):
+            directive = self._hook(
+                "freshdesk_update_ticket", {"ticket_id": 9, "status": 2, "priority": 4}
+            )
+        self.assertLessEqual(len(directive["message"]), 450)
+
+    def test_rule_key_is_not_the_bare_tool_name(self):
+        for name, args in (
+            ("freshdesk_add_private_note", {"ticket_id": 7, "body": "x"}),
+            ("freshdesk_reply_to_ticket", {"ticket_id": 7, "body": "x"}),
+            ("freshdesk_add_time_entry", {"ticket_id": 7, "time_spent": "01:00", "note": "n", "billable": True}),
+            ("freshdesk_update_ticket", {"ticket_id": 7, "status": 2, "priority": 3}),
+            ("freshdesk_create_ticket", {"fields": {"subject": "s", "description": "d", "priority": 3, "status": 2, "email": "a@b.c"}}),
+        ):
+            with self.subTest(name=name):
+                directive = self._hook(name, args)
+                self.assertNotEqual(directive["rule_key"], name)
+                self.assertTrue(directive["rule_key"].startswith(f"{name}:"))
+
+    def test_rule_key_differs_only_by_length_and_is_stable(self):
+        # 16 hex chars after the tool-name prefix.
+        directive = self._hook("freshdesk_add_private_note", {"ticket_id": 7, "body": "x"})
+        _, suffix = directive["rule_key"].split(":", 1)
+        self.assertEqual(len(suffix), 16)
+        int(suffix, 16)  # must be valid hex
+
+    def test_rule_key_changes_when_note_body_changes(self):
+        one = self._hook("freshdesk_add_private_note", {"ticket_id": 7, "body": "first"})
+        two = self._hook("freshdesk_add_private_note", {"ticket_id": 7, "body": "second"})
+        self.assertNotEqual(one["rule_key"], two["rule_key"])
+
+    def test_rule_key_changes_when_create_description_changes(self):
+        fields_a = {"subject": "s", "description": "alpha", "priority": 3, "status": 2, "email": "a@b.c"}
+        fields_b = {"subject": "s", "description": "beta", "priority": 3, "status": 2, "email": "a@b.c"}
+        one = self._hook("freshdesk_create_ticket", {"fields": fields_a})
+        two = self._hook("freshdesk_create_ticket", {"fields": fields_b})
+        self.assertNotEqual(one["rule_key"], two["rule_key"])
+
+    def test_rule_key_does_not_change_when_fetched_current_differs(self):
+        args = {"ticket_id": 7, "status": 2}
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: {"subject": "S", "status": 3, "priority": 2}):
+            first = self._hook("freshdesk_update_ticket", args)
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: {"subject": "S", "status": 5, "priority": 4}):
+            second = self._hook("freshdesk_update_ticket", args)
+        self.assertEqual(first["rule_key"], second["rule_key"])
+
+    def test_no_html_or_em_dash_in_messages(self):
+        current = {"subject": "S", "status": 2, "priority": 3}
+        cases = (
+            ("freshdesk_update_ticket", {"ticket_id": 7, "status": 2, "priority": 3}),
+            ("freshdesk_add_private_note", {"ticket_id": 7, "body": "b"}),
+            ("freshdesk_reply_to_ticket", {"ticket_id": 7, "body": "b"}),
+            ("freshdesk_add_time_entry", {"ticket_id": 7, "time_spent": "01:00", "note": "n", "billable": True}),
+            ("freshdesk_create_ticket", {"fields": {"subject": "s", "description": "d", "priority": 3, "status": 2, "email": "a@b.c"}}),
+        )
+        for name, args in cases:
+            with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: current), self.subTest(name=name):
+                directive = self._hook(name, args)
+                self.assertNotIn("<", directive["message"])
+                self.assertNotIn("—", directive["message"])
+                if name == "freshdesk_update_ticket":
+                    self.assertIn("->", directive["message"])
 
 
 if __name__ == "__main__":
