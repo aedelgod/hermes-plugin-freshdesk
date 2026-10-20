@@ -214,7 +214,7 @@ def _schema(name: str, description: str, properties: dict, required: list[str]) 
 _ID = {"type": "integer", "minimum": 1}
 _PRIORITY = {"type": "integer", "minimum": 1, "maximum": 4}
 _STATUS = {"type": "integer", "minimum": 2, "maximum": 5}
-_TIME_SPENT = {"type": "string", "pattern": "^[0-9]{1,4}:[0-5][0-9]$"}
+_TIME_SPENT = {"type": "string", "pattern": "^[0-9]{2,4}:[0-5][0-9]$"}
 _TAG_VALUE = {"type": "string", "pattern": "^[A-Za-z0-9 _-]{1,64}$"}
 _DATE_VALUE = {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
 

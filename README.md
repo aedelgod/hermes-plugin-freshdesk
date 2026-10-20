@@ -18,7 +18,7 @@ carries no tenant configuration, credentials, or ticket data.
 - `freshdesk_add_private_note` — write a plain-text private note (HTML-escaped), then verify it through conversations.
 - `freshdesk_create_ticket` — create a basic ticket, then verify every submitted field by fetching the new ticket.
 - `freshdesk_reply_to_ticket` — send a public reply to the requester of a ticket.
-- `freshdesk_add_time_entry` — add a finished (non-timer) time entry to a ticket.
+- `freshdesk_add_time_entry` — add a finished (non-timer) time entry to a ticket. `time_spent` must be `HH:MM` with at least two hour digits (`00:01`), not `H:MM` (`0:01`).
 - `freshdesk_update_ticket` — update a ticket's `status` (2-5) and/or `priority` (1-4).
 
 The five write tools (`freshdesk_add_private_note`, `freshdesk_create_ticket`, `freshdesk_reply_to_ticket`, `freshdesk_add_time_entry`, and `freshdesk_update_ticket`) register a `pre_tool_call` hook that escalates execution to Hermes' trusted human-approval gate. The language model cannot satisfy this gate with an ordinary tool argument, and unattended contexts without an approval bridge fail closed.

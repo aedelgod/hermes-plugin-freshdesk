@@ -57,7 +57,7 @@ _CDN_S3_HOST_RE = re.compile(r"^cdn\.freshdesk\.com\.s3(\.[a-z0-9-]+)?\.amazonaw
 _CERTAIN_FAILURE_STATUS = frozenset({400, 401, 403, 404, 409, 422})
 _MAX_SEARCH_PAGES = 10
 _TAG_VALUE_RE = re.compile(r"^[A-Za-z0-9 _-]{1,64}$")
-_TIME_SPENT_RE = re.compile(r"^[0-9]{1,4}:[0-5][0-9]$")
+_TIME_SPENT_RE = re.compile(r"^[0-9]{2,4}:[0-5][0-9]$")
 _DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
@@ -540,8 +540,8 @@ class FreshdeskClient:
     ) -> dict:
         ticket_id = _positive_int(ticket_id, "ticket_id")
         if not isinstance(time_spent, str) or not _TIME_SPENT_RE.fullmatch(time_spent):
-            raise ValueError("time_spent must be formatted as HHHH:MM")
-        if time_spent in ("0:00", "00:00"):
+            raise ValueError("time_spent must be formatted as HH:MM with at least two hour digits")
+        if time_spent == "00:00":
             raise ValueError("time_spent must not be zero")
         if not isinstance(note, str) or not note.strip():
             raise ValueError("note is required")
@@ -569,20 +569,36 @@ class FreshdeskClient:
             )
         entry_id = created["id"]
         try:
-            readback = self._json("GET", f"/api/v2/time_entries/{entry_id}")
-            if not isinstance(readback, dict):
-                raise FreshdeskError("time-entry readback is invalid")
-            if readback.get("ticket_id") != ticket_id:
+            found: dict | None = None
+            for page in range(1, self._max_pages + 1):
+                rows = self._json(
+                    "GET",
+                    f"/api/v2/tickets/{ticket_id}/time_entries",
+                    query={"page": page, "per_page": self._per_page},
+                )
+                if not isinstance(rows, list) or any(not isinstance(item, dict) for item in rows):
+                    raise FreshdeskError("time-entry readback is invalid")
+                for item in rows:
+                    if item.get("id") == entry_id:
+                        found = item
+                        break
+                if found is not None:
+                    break
+                if len(rows) < self._per_page:
+                    break
+            if found is None:
+                raise FreshdeskError("time-entry readback is missing")
+            if found.get("ticket_id") != ticket_id:
                 raise FreshdeskError("time-entry readback ticket_id did not match")
-            if readback.get("time_spent") != time_spent:
+            if found.get("time_spent") != time_spent:
                 raise FreshdeskError("time-entry readback time_spent did not match")
-            if readback.get("note") != note:
+            if found.get("note") != note:
                 raise FreshdeskError("time-entry readback note did not match")
-            if readback.get("billable") is not billable:
+            if found.get("billable") is not billable:
                 raise FreshdeskError("time-entry readback billable did not match")
-            if readback.get("timer_running") is not False:
+            if found.get("timer_running") is not False:
                 raise FreshdeskError("time-entry readback timer_running is not false")
-            return readback
+            return found
         except Exception as exc:
             raise FreshdeskWriteUncertainError("time-entry write", entry_id, exc) from exc
 

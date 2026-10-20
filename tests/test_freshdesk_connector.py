@@ -459,10 +459,10 @@ class FreshdeskClientTests(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, FreshdeskWriteUncertainError)
 
     def test_time_entry_sends_timer_running_false_and_billable(self):
-        created = {"id": 30, "ticket_id": 7, "time_spent": "1:30", "note": "Did work", "billable": True, "timer_running": False}
-        transport = FakeTransport([response(201, created), response(200, created)])
+        created = {"id": 30, "ticket_id": 7, "time_spent": "01:30", "note": "Did work", "billable": True, "timer_running": False}
+        transport = FakeTransport([response(201, created), response(200, [created])])
         client = FreshdeskClient("acme", "key", transport=transport)
-        result = client.add_time_entry(7, "1:30", "Did work", True)
+        result = client.add_time_entry(7, "01:30", "Did work", True)
         sent = json.loads(transport.calls[0][3].decode())
         self.assertEqual(sent["timer_running"], False)
         self.assertEqual(sent["billable"], True)
@@ -470,29 +470,29 @@ class FreshdeskClientTests(unittest.TestCase):
         self.assertEqual(result["id"], 30)
 
     def test_time_entry_sends_caller_billable_false(self):
-        created = {"id": 30, "ticket_id": 7, "time_spent": "2:00", "note": "Work", "billable": False, "timer_running": False}
-        transport = FakeTransport([response(201, created), response(200, created)])
+        created = {"id": 30, "ticket_id": 7, "time_spent": "02:00", "note": "Work", "billable": False, "timer_running": False}
+        transport = FakeTransport([response(201, created), response(200, [created])])
         client = FreshdeskClient("acme", "key", transport=transport)
-        client.add_time_entry(7, "2:00", "Work", False)
+        client.add_time_entry(7, "02:00", "Work", False)
         sent = json.loads(transport.calls[0][3].decode())
         self.assertEqual(sent["billable"], False)
         self.assertEqual(sent["timer_running"], False)
         self.assertNotIn("start_time", sent)
 
     def test_time_entry_sends_agent_id_when_provided(self):
-        created = {"id": 30, "ticket_id": 7, "time_spent": "1:00", "note": "Work", "billable": True, "timer_running": False}
-        transport = FakeTransport([response(201, created), response(200, created)])
+        created = {"id": 30, "ticket_id": 7, "time_spent": "01:00", "note": "Work", "billable": True, "timer_running": False}
+        transport = FakeTransport([response(201, created), response(200, [created])])
         client = FreshdeskClient("acme", "key", transport=transport)
-        client.add_time_entry(7, "1:00", "Work", True, agent_id=5)
+        client.add_time_entry(7, "01:00", "Work", True, agent_id=5)
         sent = json.loads(transport.calls[0][3].decode())
         self.assertEqual(sent["agent_id"], 5)
         self.assertNotIn("start_time", sent)
 
     def test_time_entry_omits_agent_id_when_not_provided(self):
-        created = {"id": 30, "ticket_id": 7, "time_spent": "1:00", "note": "Work", "billable": True, "timer_running": False}
-        transport = FakeTransport([response(201, created), response(200, created)])
+        created = {"id": 30, "ticket_id": 7, "time_spent": "01:00", "note": "Work", "billable": True, "timer_running": False}
+        transport = FakeTransport([response(201, created), response(200, [created])])
         client = FreshdeskClient("acme", "key", transport=transport)
-        client.add_time_entry(7, "1:00", "Work", True)
+        client.add_time_entry(7, "01:00", "Work", True)
         sent = json.loads(transport.calls[0][3].decode())
         self.assertNotIn("agent_id", sent)
         self.assertNotIn("start_time", sent)
@@ -504,16 +504,19 @@ class FreshdeskClientTests(unittest.TestCase):
             client.add_time_entry(7, None, "note", True)
         self.assertEqual(len(transport.calls), 0)
         with self.assertRaises(ValueError):
-            client.add_time_entry(7, "00:00", "note", True)
+            client.add_time_entry(7, "0:01", "note", True)
         self.assertEqual(len(transport.calls), 0)
         with self.assertRaises(ValueError):
             client.add_time_entry(7, "0:00", "note", True)
+        self.assertEqual(len(transport.calls), 0)
+        with self.assertRaises(ValueError):
+            client.add_time_entry(7, "00:00", "note", True)
         self.assertEqual(len(transport.calls), 0)
 
     def test_time_entry_invalid_time_spent_does_not_call_transport(self):
         transport = FakeTransport([])
         client = FreshdeskClient("acme", "key", transport=transport)
-        for bad in ("1:60", "100000:00", "1:0", "abc"):
+        for bad in ("1:60", "100000:00", "1:30", "1:0", "abc"):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     client.add_time_entry(7, bad, "note", True)
@@ -523,17 +526,44 @@ class FreshdeskClientTests(unittest.TestCase):
         transport = FakeTransport([response(400, {"message": "bad request"})])
         client = FreshdeskClient("acme", "key", transport=transport)
         with self.assertRaises(FreshdeskError) as caught:
-            client.add_time_entry(7, "1:30", "note", True)
+            client.add_time_entry(7, "01:30", "note", True)
         self.assertNotIsInstance(caught.exception, FreshdeskWriteUncertainError)
 
     def test_time_entry_readback_mismatch_is_ambiguous(self):
-        created = {"id": 30, "time_spent": "1:30", "note": "Did work", "billable": True, "timer_running": False}
+        created = {"id": 30, "time_spent": "01:30", "note": "Did work", "billable": True, "timer_running": False}
         readback = {"id": 30, "ticket_id": 7, "time_spent": "2:00", "note": "Did work", "billable": True, "timer_running": False}
-        transport = FakeTransport([response(201, created), response(200, readback)])
+        transport = FakeTransport([response(201, created), response(200, [readback])])
         client = FreshdeskClient("acme", "key", transport=transport)
         with self.assertRaises(FreshdeskWriteUncertainError) as caught:
-            client.add_time_entry(7, "1:30", "Did work", True)
+            client.add_time_entry(7, "01:30", "Did work", True)
         self.assertEqual(caught.exception.created_id, 30)
+
+    def test_time_entry_readback_uses_ticket_list_not_singular_get(self):
+        created = {"id": 30, "ticket_id": 7, "time_spent": "00:01", "note": "Did work", "billable": True, "timer_running": False}
+        transport = FakeTransport([response(201, created), response(200, [created])])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        result = client.add_time_entry(7, "00:01", "Did work", True)
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent["time_spent"], "00:01")
+        self.assertEqual(sent["billable"], True)
+        self.assertEqual(sent["timer_running"], False)
+        self.assertNotIn("start_time", sent)
+        self.assertEqual(transport.calls[1][0], "GET")
+        parsed = urllib.parse.urlsplit(transport.calls[1][1])
+        self.assertEqual(parsed.path, "/api/v2/tickets/7/time_entries")
+        self.assertFalse(any("/api/v2/time_entries/" in call[1] for call in transport.calls))
+        self.assertEqual(result, created)
+
+    def test_time_entry_missing_from_readback_list_is_ambiguous(self):
+        created = {"id": 30, "ticket_id": 7, "time_spent": "00:01", "note": "Did work", "billable": True, "timer_running": False}
+        other = {"id": 99, "ticket_id": 7, "time_spent": "00:05", "note": "Other", "billable": False, "timer_running": False}
+        transport = FakeTransport([response(201, created), response(200, [other])])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with self.assertRaises(FreshdeskWriteUncertainError) as caught:
+            client.add_time_entry(7, "00:01", "Did work", True)
+        self.assertEqual(caught.exception.created_id, 30)
+        posts = [call for call in transport.calls if call[0] == "POST"]
+        self.assertEqual(len(posts), 1)
 
     def test_update_ticket_sends_only_status_and_priority_then_verifies_get(self):
         created = {"id": 1, "status": 2, "priority": 3}
