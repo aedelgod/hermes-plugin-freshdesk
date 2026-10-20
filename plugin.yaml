@@ -1,5 +1,5 @@
 name: freshdesk
-version: 0.1.1
+version: 0.2.0
 description: "Generic Freshdesk v2 tools for Hermes Agent."
 author: GFORGOV®
 kind: tools
@@ -15,6 +15,9 @@ provides_tools:
   - freshdesk_download_attachment
   - freshdesk_add_private_note
   - freshdesk_create_ticket
+  - freshdesk_reply_to_ticket
+  - freshdesk_add_time_entry
+  - freshdesk_update_ticket
 requires_env:
   - FRESHDESK_DOMAIN
   - FRESHDESK_API_KEY

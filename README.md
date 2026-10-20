@@ -11,14 +11,17 @@ carries no tenant configuration, credentials, or ticket data.
 
 - `freshdesk_list_tickets` — bounded ticket pagination with `updated_since` and an `include_description` option. Returns `truncated` rather than discarding pages when the page cap is reached.
 - `freshdesk_get_ticket` — fetch one ticket by ID.
-- `freshdesk_search_tickets` — read-only search by `status` (2-5) and/or `priority` (1-4). At least one filter is required; the query is built and URL-encoded by the client.
+- `freshdesk_search_tickets` — read-only search by `status` (2-5), `priority` (1-4), `tag`, `type`, `agent_id`, `group_id`, or `created_at`/`updated_at` date ranges. At least one filter is required; the query is built and URL-encoded by the client.
 - `freshdesk_list_conversations` — fetch a bounded complete conversation list.
 - `freshdesk_get_contact` — fetch one contact by ID.
 - `freshdesk_download_attachment` — resolve an attachment by ticket and attachment ID, then download it from the Freshdesk CDN/S3 origin to the Hermes cache. No caller-controlled URL.
 - `freshdesk_add_private_note` — write a plain-text private note (HTML-escaped), then verify it through conversations.
 - `freshdesk_create_ticket` — create a basic ticket, then verify every submitted field by fetching the new ticket.
+- `freshdesk_reply_to_ticket` — send a public reply to the requester of a ticket.
+- `freshdesk_add_time_entry` — add a finished (non-timer) time entry to a ticket.
+- `freshdesk_update_ticket` — update a ticket's `status` (2-5) and/or `priority` (1-4).
 
-The two write tools (`freshdesk_add_private_note` and `freshdesk_create_ticket`) register a `pre_tool_call` hook that escalates execution to Hermes' trusted human-approval gate. The language model cannot satisfy this gate with an ordinary tool argument, and unattended contexts without an approval bridge fail closed.
+The five write tools (`freshdesk_add_private_note`, `freshdesk_create_ticket`, `freshdesk_reply_to_ticket`, `freshdesk_add_time_entry`, and `freshdesk_update_ticket`) register a `pre_tool_call` hook that escalates execution to Hermes' trusted human-approval gate. The language model cannot satisfy this gate with an ordinary tool argument, and unattended contexts without an approval bridge fail closed.
 
 ## Configuration
 
@@ -69,4 +72,7 @@ python3 -m unittest discover -s tests -v
 
 - `freshdesk_download_attachment` takes only `ticket_id` and `attachment_id`; the URL is always derived from Freshdesk.
 - `freshdesk_create_ticket` accepts only `subject`, `description`, `priority`, `status`, and exactly one of `email` or `requester_id`.
-- `freshdesk_search_tickets` accepts only `status` and `priority`; it never accepts a raw query string.
+- `freshdesk_reply_to_ticket` accepts only `ticket_id` and `body`.
+- `freshdesk_add_time_entry` accepts only `ticket_id`, `time_spent`, `note`, `billable`, and `agent_id`.
+- `freshdesk_update_ticket` accepts only `ticket_id`, `status`, and `priority`.
+- `freshdesk_search_tickets` accepts only `status`, `priority`, `tag`, `type`, `agent_id`, `group_id`, `created_after`, `created_before`, `updated_after`, and `updated_before`; it never accepts a raw query string. Subject, description, and keyword search are intentionally unsupported and rejected if added to the call.

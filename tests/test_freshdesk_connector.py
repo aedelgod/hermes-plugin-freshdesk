@@ -411,6 +411,229 @@ class FreshdeskClientTests(unittest.TestCase):
                 client.download_attachment(5, 1, linked)
             self.assertFalse((outside / "x.pdf").exists())
 
+    def test_reply_posts_escaped_html_and_verifies_readback(self):
+        created = {"id": 50, "body_text": "Hello world"}
+        conversation = {"id": 50, "private": False, "incoming": False, "body_text": "Hello world"}
+        transport = FakeTransport([response(201, created), response(200, [conversation])])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        result = client.reply_to_ticket(7, "Hello world")
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent, {"body": "<div>Hello world</div>"})
+        self.assertEqual(transport.calls[0][0], "POST")
+        self.assertEqual(transport.calls[0][1], "https://acme.freshdesk.com/api/v2/tickets/7/reply")
+        self.assertEqual(result["id"], 50)
+        self.assertEqual(transport.calls[1][0], "GET")
+
+    def test_reply_escapes_html_in_body(self):
+        created = {"id": 50, "body_text": "<b>safe</b>"}
+        conversation = {"id": 50, "private": False, "incoming": False, "body_text": "<b>safe</b>"}
+        transport = FakeTransport([response(201, created), response(200, [conversation])])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        client.reply_to_ticket(7, "<b>safe</b>")
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent["body"], "<div>&lt;b&gt;safe&lt;/b&gt;</div>")
+
+    def test_reply_converts_newlines_to_br(self):
+        created = {"id": 50, "body_text": "Line1\nLine2"}
+        conversation = {"id": 50, "private": False, "incoming": False, "body_text": "Line1\nLine2"}
+        transport = FakeTransport([response(201, created), response(200, [conversation])])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        client.reply_to_ticket(7, "Line1\nLine2")
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent["body"], "<div>Line1<br>Line2</div>")
+
+    def test_reply_readback_requires_private_false(self):
+        created = {"id": 50, "body_text": "Hello world"}
+        conversation = {"id": 50, "private": True, "incoming": False, "body_text": "Hello world"}
+        transport = FakeTransport([response(201, created), response(200, [conversation])])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with self.assertRaises(FreshdeskWriteUncertainError) as caught:
+            client.reply_to_ticket(7, "Hello world")
+        self.assertEqual(caught.exception.created_id, 50)
+
+    def test_reply_post_400_is_a_definite_failure(self):
+        transport = FakeTransport([response(400, {"message": "bad request"})])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with self.assertRaises(FreshdeskError) as caught:
+            client.reply_to_ticket(7, "Hello")
+        self.assertNotIsInstance(caught.exception, FreshdeskWriteUncertainError)
+
+    def test_time_entry_sends_timer_running_false_and_billable(self):
+        created = {"id": 30, "ticket_id": 7, "time_spent": "1:30", "note": "Did work", "billable": True, "timer_running": False}
+        transport = FakeTransport([response(201, created), response(200, created)])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        result = client.add_time_entry(7, "1:30", "Did work", True)
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent["timer_running"], False)
+        self.assertEqual(sent["billable"], True)
+        self.assertNotIn("start_time", sent)
+        self.assertEqual(result["id"], 30)
+
+    def test_time_entry_sends_caller_billable_false(self):
+        created = {"id": 30, "ticket_id": 7, "time_spent": "2:00", "note": "Work", "billable": False, "timer_running": False}
+        transport = FakeTransport([response(201, created), response(200, created)])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        client.add_time_entry(7, "2:00", "Work", False)
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent["billable"], False)
+        self.assertEqual(sent["timer_running"], False)
+        self.assertNotIn("start_time", sent)
+
+    def test_time_entry_sends_agent_id_when_provided(self):
+        created = {"id": 30, "ticket_id": 7, "time_spent": "1:00", "note": "Work", "billable": True, "timer_running": False}
+        transport = FakeTransport([response(201, created), response(200, created)])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        client.add_time_entry(7, "1:00", "Work", True, agent_id=5)
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent["agent_id"], 5)
+        self.assertNotIn("start_time", sent)
+
+    def test_time_entry_omits_agent_id_when_not_provided(self):
+        created = {"id": 30, "ticket_id": 7, "time_spent": "1:00", "note": "Work", "billable": True, "timer_running": False}
+        transport = FakeTransport([response(201, created), response(200, created)])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        client.add_time_entry(7, "1:00", "Work", True)
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertNotIn("agent_id", sent)
+        self.assertNotIn("start_time", sent)
+
+    def test_time_entry_missing_or_zero_time_spent_does_not_call_transport(self):
+        transport = FakeTransport([])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with self.assertRaises(ValueError):
+            client.add_time_entry(7, None, "note", True)
+        self.assertEqual(len(transport.calls), 0)
+        with self.assertRaises(ValueError):
+            client.add_time_entry(7, "00:00", "note", True)
+        self.assertEqual(len(transport.calls), 0)
+        with self.assertRaises(ValueError):
+            client.add_time_entry(7, "0:00", "note", True)
+        self.assertEqual(len(transport.calls), 0)
+
+    def test_time_entry_invalid_time_spent_does_not_call_transport(self):
+        transport = FakeTransport([])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        for bad in ("1:60", "100000:00", "1:0", "abc"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    client.add_time_entry(7, bad, "note", True)
+        self.assertEqual(len(transport.calls), 0)
+
+    def test_time_entry_post_400_is_a_definite_failure(self):
+        transport = FakeTransport([response(400, {"message": "bad request"})])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with self.assertRaises(FreshdeskError) as caught:
+            client.add_time_entry(7, "1:30", "note", True)
+        self.assertNotIsInstance(caught.exception, FreshdeskWriteUncertainError)
+
+    def test_time_entry_readback_mismatch_is_ambiguous(self):
+        created = {"id": 30, "time_spent": "1:30", "note": "Did work", "billable": True, "timer_running": False}
+        readback = {"id": 30, "ticket_id": 7, "time_spent": "2:00", "note": "Did work", "billable": True, "timer_running": False}
+        transport = FakeTransport([response(201, created), response(200, readback)])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with self.assertRaises(FreshdeskWriteUncertainError) as caught:
+            client.add_time_entry(7, "1:30", "Did work", True)
+        self.assertEqual(caught.exception.created_id, 30)
+
+    def test_update_ticket_sends_only_status_and_priority_then_verifies_get(self):
+        created = {"id": 1, "status": 2, "priority": 3}
+        readback = {"id": 1, "status": 2, "priority": 3, "subject": "test"}
+        transport = FakeTransport([response(200, created), response(200, readback)])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        result = client.update_ticket(1, status=2, priority=3)
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent, {"status": 2, "priority": 3})
+        self.assertEqual(transport.calls[0][0], "PUT")
+        self.assertEqual(transport.calls[1][0], "GET")
+        self.assertEqual(transport.calls[1][1], "https://acme.freshdesk.com/api/v2/tickets/1")
+        self.assertEqual(result, readback)
+
+    def test_update_ticket_with_only_status(self):
+        created = {"id": 1, "status": 2}
+        readback = {"id": 1, "status": 2, "priority": 3}
+        transport = FakeTransport([response(200, created), response(200, readback)])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        result = client.update_ticket(1, status=2)
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent, {"status": 2})
+        self.assertNotIn("priority", sent)
+        self.assertEqual(result["status"], 2)
+
+    def test_update_ticket_with_only_priority(self):
+        created = {"id": 1, "priority": 3}
+        readback = {"id": 1, "status": 2, "priority": 3}
+        transport = FakeTransport([response(200, created), response(200, readback)])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        result = client.update_ticket(1, priority=3)
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent, {"priority": 3})
+        self.assertNotIn("status", sent)
+        self.assertEqual(result["priority"], 3)
+
+    def test_update_rejects_extra_body_field_without_transport_call(self):
+        transport = FakeTransport([])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with self.assertRaises(TypeError):
+            client.update_ticket(1, status=2, subject="whatever")
+        self.assertEqual(len(transport.calls), 0)
+
+    def test_update_requires_at_least_one_of_status_or_priority(self):
+        transport = FakeTransport([])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with self.assertRaisesRegex(ValueError, "at least one"):
+            client.update_ticket(1)
+        self.assertEqual(len(transport.calls), 0)
+
+    def test_update_readback_mismatch_is_ambiguous(self):
+        created = {"id": 1, "status": 2, "priority": 3}
+        readback = {"id": 1, "status": 3, "priority": 3}
+        transport = FakeTransport([response(200, created), response(200, readback)])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with self.assertRaises(FreshdeskWriteUncertainError) as caught:
+            client.update_ticket(1, status=2)
+        self.assertEqual(caught.exception.created_id, 1)
+
+    def test_update_put_400_is_a_definite_failure(self):
+        transport = FakeTransport([response(400, {"message": "bad request"})])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with self.assertRaises(FreshdeskError) as caught:
+            client.update_ticket(1, status=2)
+        self.assertNotIsInstance(caught.exception, FreshdeskWriteUncertainError)
+
+    def test_search_builds_query_with_tag_type_agent_group_and_date_range(self):
+        transport = FakeTransport([response(200, {"results": [], "total": 0})])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        client.search_tickets(
+            tag="Alpha", type="Question", agent_id=9, group_id=4,
+            created_after="2026-10-01", created_before="2026-10-20",
+        )
+        _, url, _, _, _ = transport.calls[0]
+        parsed = urllib.parse.urlsplit(url)
+        query = urllib.parse.parse_qs(parsed.query)["query"][0]
+        self.assertIn("tag:'Alpha'", query)
+        self.assertIn("type:'Question'", query)
+        self.assertIn("agent_id:9", query)
+        self.assertIn("group_id:4", query)
+        self.assertIn("created_at:>'2026-10-01'", query)
+        self.assertIn("created_at:<'2026-10-20'", query)
+
+    def test_search_rejects_tag_with_quote(self):
+        client = FreshdeskClient("acme", "key")
+        with self.assertRaisesRegex(ValueError, "invalid characters"):
+            client.search_tickets(tag="Alpha'")
+
+    def test_search_rejects_invalid_date(self):
+        client = FreshdeskClient("acme", "key")
+        with self.assertRaisesRegex(ValueError, "real calendar date"):
+            client.search_tickets(created_after="2026-02-30")
+        with self.assertRaisesRegex(ValueError, "YYYY-MM-DD"):
+            client.search_tickets(created_after="2026/10/01")
+
+    def test_search_rejects_date_range_where_after_is_not_before(self):
+        client = FreshdeskClient("acme", "key")
+        with self.assertRaisesRegex(ValueError, "must be before"):
+            client.search_tickets(created_after="2026-10-20", created_before="2026-10-01")
+
 
 class PluginRegistrationTests(unittest.TestCase):
     def test_registers_expected_tool_surface(self):
@@ -435,6 +658,8 @@ class PluginRegistrationTests(unittest.TestCase):
             "freshdesk_search_tickets", "freshdesk_list_conversations",
             "freshdesk_get_contact", "freshdesk_download_attachment",
             "freshdesk_add_private_note", "freshdesk_create_ticket",
+            "freshdesk_reply_to_ticket", "freshdesk_add_time_entry",
+            "freshdesk_update_ticket",
         })
         for item in ctx.tools:
             self.assertEqual(item["check_fn"], freshdesk_connector._available)
@@ -448,6 +673,16 @@ class PluginRegistrationTests(unittest.TestCase):
         self.assertIn("private note", directive["message"])
         directive = hook(tool_name="freshdesk_create_ticket", args={})
         self.assertEqual(directive["action"], "approve")
+        directive = hook(tool_name="freshdesk_reply_to_ticket", args={"ticket_id": 7, "body": "Hello"})
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("public reply", directive["message"])
+        directive = hook(tool_name="freshdesk_add_time_entry", args={"ticket_id": 7, "time_spent": "1:30", "billable": True})
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("time entry", directive["message"])
+        self.assertIn("1:30", directive["message"])
+        directive = hook(tool_name="freshdesk_update_ticket", args={"ticket_id": 7, "status": 2, "priority": 3})
+        self.assertEqual(directive["action"], "approve")
+        self.assertIn("7", directive["message"])
 
     def test_list_tickets_schema_has_no_status(self):
         class Capture:
@@ -470,8 +705,25 @@ class PluginRegistrationTests(unittest.TestCase):
 
         search_params = cap.schemas["freshdesk_search_tickets"]["parameters"]
         self.assertEqual(search_params["additionalProperties"], False)
-        self.assertEqual(set(search_params["properties"]), {"status", "priority"})
+        self.assertEqual(set(search_params["properties"]), {
+            "status", "priority", "tag", "type", "agent_id", "group_id",
+            "created_after", "created_before", "updated_after", "updated_before",
+        })
         self.assertNotIn("query", search_params["properties"])
+        self.assertNotIn("subject", search_params["properties"])
+        self.assertNotIn("keyword", search_params["properties"])
+
+        reply_params = cap.schemas["freshdesk_reply_to_ticket"]["parameters"]
+        self.assertEqual(reply_params["additionalProperties"], False)
+        self.assertEqual(set(reply_params["properties"]), {"ticket_id", "body"})
+
+        time_params = cap.schemas["freshdesk_add_time_entry"]["parameters"]
+        self.assertEqual(time_params["additionalProperties"], False)
+        self.assertEqual(set(time_params["properties"]), {"ticket_id", "time_spent", "note", "billable", "agent_id"})
+
+        update_params = cap.schemas["freshdesk_update_ticket"]["parameters"]
+        self.assertEqual(update_params["additionalProperties"], False)
+        self.assertEqual(set(update_params["properties"]), {"ticket_id", "status", "priority"})
 
         create_params = cap.schemas["freshdesk_create_ticket"]["parameters"]
         fields = create_params["properties"]["fields"]
@@ -526,6 +778,14 @@ class HandlerResultTests(unittest.TestCase):
         data = json.loads(result)
         self.assertFalse(data["success"])
         self.assertIn("raw query", data["error"])
+
+    def test_search_tickets_handler_rejects_subject_and_keyword(self):
+        for field in ("subject", "keyword"):
+            with self.subTest(field=field):
+                result = _search_tickets({field: "printer"})
+                data = json.loads(result)
+                self.assertFalse(data["success"])
+                self.assertIn("does not accept", data["error"])
 
 
 if __name__ == "__main__":

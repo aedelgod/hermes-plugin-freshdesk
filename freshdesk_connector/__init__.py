@@ -70,6 +70,28 @@ def _approval_hook(tool_name: str, args: dict | None = None, **_: Any):
             "action": "approve",
             "message": "Create a new Freshdesk ticket",
         }
+    if tool_name == "freshdesk_reply_to_ticket":
+        ticket = (args or {}).get("ticket_id", "unknown")
+        return {
+            "action": "approve",
+            "message": f"Send a public reply to the requester of Freshdesk ticket {ticket}",
+        }
+    if tool_name == "freshdesk_add_time_entry":
+        ticket = (args or {}).get("ticket_id", "unknown")
+        duration = (args or {}).get("time_spent", "unknown")
+        billable = (args or {}).get("billable", "unknown")
+        return {
+            "action": "approve",
+            "message": f"Add time entry of {duration} to Freshdesk ticket {ticket} (billable: {billable})",
+        }
+    if tool_name == "freshdesk_update_ticket":
+        ticket = (args or {}).get("ticket_id", "unknown")
+        fields = sorted(k for k in (args or {}) if k in ("status", "priority"))
+        field_text = ", ".join(fields) if fields else "no fields"
+        return {
+            "action": "approve",
+            "message": f"Update Freshdesk ticket {ticket}: {field_text}",
+        }
     return None
 
 
@@ -125,13 +147,52 @@ def _create_ticket(args: dict, **_: Any) -> str:
     return _result(run)
 
 
+def _reply_to_ticket(args: dict, **_: Any) -> str:
+    def run():
+        return _client().reply_to_ticket(args.get("ticket_id"), args.get("body"))
+    return _result(run)
+
+
+def _add_time_entry(args: dict, **_: Any) -> str:
+    def run():
+        return _client().add_time_entry(
+            args.get("ticket_id"),
+            args.get("time_spent"),
+            args.get("note"),
+            args.get("billable"),
+            args.get("agent_id"),
+        )
+    return _result(run)
+
+
+def _update_ticket(args: dict, **_: Any) -> str:
+    def run():
+        return _client().update_ticket(
+            args.get("ticket_id"),
+            status=args.get("status"),
+            priority=args.get("priority"),
+        )
+    return _result(run)
+
+
 def _search_tickets(args: dict, **_: Any) -> str:
     def run():
         if "query" in args:
             raise ValueError("freshdesk_search_tickets does not accept a raw query argument")
+        for rejected in ("subject", "keyword"):
+            if rejected in args:
+                raise ValueError(f"freshdesk_search_tickets does not accept a {rejected} argument")
         return _client().search_tickets(
             status=args.get("status"),
             priority=args.get("priority"),
+            tag=args.get("tag"),
+            type=args.get("type"),
+            agent_id=args.get("agent_id"),
+            group_id=args.get("group_id"),
+            created_after=args.get("created_after"),
+            created_before=args.get("created_before"),
+            updated_after=args.get("updated_after"),
+            updated_before=args.get("updated_before"),
         )
 
     return _result(run)
@@ -153,6 +214,9 @@ def _schema(name: str, description: str, properties: dict, required: list[str]) 
 _ID = {"type": "integer", "minimum": 1}
 _PRIORITY = {"type": "integer", "minimum": 1, "maximum": 4}
 _STATUS = {"type": "integer", "minimum": 2, "maximum": 5}
+_TIME_SPENT = {"type": "string", "pattern": "^[0-9]{1,4}:[0-5][0-9]$"}
+_TAG_VALUE = {"type": "string", "pattern": "^[A-Za-z0-9 _-]{1,64}$"}
+_DATE_VALUE = {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
 
 _CREATE_FIELDS = {
     "type": "object",
@@ -195,9 +259,16 @@ _TOOLS = (
         "freshdesk_search_tickets",
         _schema(
             "freshdesk_search_tickets",
-            "Search Freshdesk tickets by status (2-5) and/or priority (1-4). "
+            "Search Freshdesk tickets by status (2-5), priority (1-4), tag, type, "
+            "agent_id, group_id, or created_at/updated_at date ranges. "
             "At least one filter is required. This is a read-only list operation.",
-            {"status": _STATUS, "priority": _PRIORITY},
+            {
+                "status": _STATUS, "priority": _PRIORITY,
+                "tag": _TAG_VALUE, "type": _TAG_VALUE,
+                "agent_id": _ID, "group_id": _ID,
+                "created_after": _DATE_VALUE, "created_before": _DATE_VALUE,
+                "updated_after": _DATE_VALUE, "updated_before": _DATE_VALUE,
+            },
             [],
         ),
         _search_tickets,
@@ -253,6 +324,42 @@ _TOOLS = (
             ["fields"],
         ),
         _create_ticket,
+    ),
+    (
+        "freshdesk_reply_to_ticket",
+        _schema(
+            "freshdesk_reply_to_ticket",
+            "Send a public reply to the requester of a Freshdesk ticket. Hermes requires human approval before execution.",
+            {"ticket_id": _ID, "body": {"type": "string"}},
+            ["ticket_id", "body"],
+        ),
+        _reply_to_ticket,
+    ),
+    (
+        "freshdesk_add_time_entry",
+        _schema(
+            "freshdesk_add_time_entry",
+            "Add a finished time entry to a Freshdesk ticket. Hermes requires human approval before execution.",
+            {
+                "ticket_id": _ID,
+                "time_spent": _TIME_SPENT,
+                "note": {"type": "string"},
+                "billable": {"type": "boolean"},
+                "agent_id": _ID,
+            },
+            ["ticket_id", "time_spent", "note", "billable"],
+        ),
+        _add_time_entry,
+    ),
+    (
+        "freshdesk_update_ticket",
+        _schema(
+            "freshdesk_update_ticket",
+            "Update a Freshdesk ticket's status (2-5) and/or priority (1-4). Hermes requires human approval before execution.",
+            {"ticket_id": _ID, "status": _STATUS, "priority": _PRIORITY},
+            ["ticket_id"],
+        ),
+        _update_ticket,
     ),
 )
 

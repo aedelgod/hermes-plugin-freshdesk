@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import datetime
 import html
 import json
 import os
@@ -55,6 +56,9 @@ _CDN_S3_HOST_RE = re.compile(r"^cdn\.freshdesk\.com\.s3(\.[a-z0-9-]+)?\.amazonaw
 # transport failures) is treated as an ambiguous write.
 _CERTAIN_FAILURE_STATUS = frozenset({400, 401, 403, 404, 409, 422})
 _MAX_SEARCH_PAGES = 10
+_TAG_VALUE_RE = re.compile(r"^[A-Za-z0-9 _-]{1,64}$")
+_TIME_SPENT_RE = re.compile(r"^[0-9]{1,4}:[0-5][0-9]$")
+_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
 class _RejectRedirects(urllib.request.HTTPRedirectHandler):
@@ -116,6 +120,16 @@ def _default_transport(method, url, headers, body, timeout, limit):
 def _positive_int(value: object, label: str) -> int:
     if type(value) is not int or value <= 0:
         raise ValueError(f"{label} must be a positive integer")
+    return value
+
+
+def _validate_date(value: object, label: str) -> str:
+    if not isinstance(value, str) or not _DATE_RE.fullmatch(value):
+        raise ValueError(f"{label} must be YYYY-MM-DD")
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        raise ValueError(f"{label} is not a real calendar date") from None
     return value
 
 
@@ -209,7 +223,7 @@ class FreshdeskClient:
         self._headers = {
             "Authorization": f"Basic {credential}",
             "Accept": "application/json",
-            "User-Agent": "Hermes-Freshdesk-Connector/0.1.1",
+            "User-Agent": "Hermes-Freshdesk-Connector/0.2.0",
         }
         self._transport = transport or _default_transport
         self._bounded_transport = transport is None
@@ -484,7 +498,140 @@ class FreshdeskClient:
         except Exception as exc:
             raise FreshdeskWriteUncertainError("ticket creation", ticket_id, exc) from exc
 
-    def search_tickets(self, *, status: int | None = None, priority: int | None = None) -> dict:
+    def reply_to_ticket(self, ticket_id: int, body: str) -> dict:
+        ticket_id = _positive_int(ticket_id, "ticket_id")
+        if not isinstance(body, str) or not body.strip():
+            raise ValueError("body is required")
+        clean_body = body.strip()
+        html_body = f"<div>{html.escape(clean_body).replace(chr(10), '<br>')}</div>"
+        try:
+            created = self._json(
+                "POST", f"/api/v2/tickets/{ticket_id}/reply",
+                payload={"body": html_body},
+            )
+        except FreshdeskHttpError as exc:
+            if exc.status in _CERTAIN_FAILURE_STATUS:
+                raise FreshdeskError(f"reply write rejected by Freshdesk: HTTP {exc.status}") from exc
+            raise FreshdeskWriteUncertainError("reply write", None, exc) from exc
+        except FreshdeskTransportError as exc:
+            raise FreshdeskWriteUncertainError("reply write", None, exc) from exc
+        if not isinstance(created, dict) or type(created.get("id")) is not int:
+            raise FreshdeskWriteUncertainError(
+                "reply write", None, FreshdeskError("reply response is invalid")
+            )
+        conv_id = created["id"]
+        try:
+            conversations = self.list_conversations(ticket_id)
+            matches = [item for item in conversations if item.get("id") == conv_id]
+            if (
+                len(matches) != 1
+                or matches[0].get("private") is not False
+                or matches[0].get("incoming") is not False
+                or str(matches[0].get("body_text", "")).replace("\r\n", "\n").strip()
+                != clean_body.replace("\r\n", "\n")
+            ):
+                raise FreshdeskError("reply readback did not match")
+            return matches[0]
+        except Exception as exc:
+            raise FreshdeskWriteUncertainError("reply write", conv_id, exc) from exc
+
+    def add_time_entry(
+        self, ticket_id: int, time_spent: str, note: str, billable: bool, agent_id: int | None = None
+    ) -> dict:
+        ticket_id = _positive_int(ticket_id, "ticket_id")
+        if not isinstance(time_spent, str) or not _TIME_SPENT_RE.fullmatch(time_spent):
+            raise ValueError("time_spent must be formatted as HHHH:MM")
+        if time_spent in ("0:00", "00:00"):
+            raise ValueError("time_spent must not be zero")
+        if not isinstance(note, str) or not note.strip():
+            raise ValueError("note is required")
+        if type(billable) is not bool:
+            raise ValueError("billable must be a boolean")
+        if agent_id is not None:
+            agent_id = _positive_int(agent_id, "agent_id")
+        payload = {"time_spent": time_spent, "note": note, "billable": billable, "timer_running": False}
+        if agent_id is not None:
+            payload["agent_id"] = agent_id
+        try:
+            created = self._json(
+                "POST", f"/api/v2/tickets/{ticket_id}/time_entries",
+                payload=payload,
+            )
+        except FreshdeskHttpError as exc:
+            if exc.status in _CERTAIN_FAILURE_STATUS:
+                raise FreshdeskError(f"time-entry write rejected by Freshdesk: HTTP {exc.status}") from exc
+            raise FreshdeskWriteUncertainError("time-entry write", None, exc) from exc
+        except FreshdeskTransportError as exc:
+            raise FreshdeskWriteUncertainError("time-entry write", None, exc) from exc
+        if not isinstance(created, dict) or type(created.get("id")) is not int:
+            raise FreshdeskWriteUncertainError(
+                "time-entry write", None, FreshdeskError("time-entry response is invalid")
+            )
+        entry_id = created["id"]
+        try:
+            readback = self._json("GET", f"/api/v2/time_entries/{entry_id}")
+            if not isinstance(readback, dict):
+                raise FreshdeskError("time-entry readback is invalid")
+            if readback.get("ticket_id") != ticket_id:
+                raise FreshdeskError("time-entry readback ticket_id did not match")
+            if readback.get("time_spent") != time_spent:
+                raise FreshdeskError("time-entry readback time_spent did not match")
+            if readback.get("note") != note:
+                raise FreshdeskError("time-entry readback note did not match")
+            if readback.get("billable") is not billable:
+                raise FreshdeskError("time-entry readback billable did not match")
+            if readback.get("timer_running") is not False:
+                raise FreshdeskError("time-entry readback timer_running is not false")
+            return readback
+        except Exception as exc:
+            raise FreshdeskWriteUncertainError("time-entry write", entry_id, exc) from exc
+
+    def update_ticket(self, ticket_id: int, *, status: int | None = None, priority: int | None = None) -> dict:
+        ticket_id = _positive_int(ticket_id, "ticket_id")
+        if status is None and priority is None:
+            raise ValueError("update_ticket requires at least one of status or priority")
+        sent: dict[str, int] = {}
+        if status is not None:
+            _positive_int(status, "status")
+            if not 2 <= status <= 5:
+                raise ValueError("status must be between 2 and 5")
+            sent["status"] = status
+        if priority is not None:
+            _positive_int(priority, "priority")
+            if not 1 <= priority <= 4:
+                raise ValueError("priority must be between 1 and 4")
+            sent["priority"] = priority
+        try:
+            updated = self._json("PUT", f"/api/v2/tickets/{ticket_id}", payload=sent)
+        except FreshdeskHttpError as exc:
+            if exc.status in _CERTAIN_FAILURE_STATUS:
+                raise FreshdeskError(f"ticket update rejected by Freshdesk: HTTP {exc.status}") from exc
+            raise FreshdeskWriteUncertainError("ticket update", ticket_id, exc) from exc
+        except FreshdeskTransportError as exc:
+            raise FreshdeskWriteUncertainError("ticket update", ticket_id, exc) from exc
+        try:
+            readback = self.get_ticket(ticket_id)
+            for key, value in sent.items():
+                if readback.get(key) != value:
+                    raise FreshdeskError(f"ticket readback field {key} did not match")
+            return readback
+        except Exception as exc:
+            raise FreshdeskWriteUncertainError("ticket update", ticket_id, exc) from exc
+
+    def search_tickets(
+        self,
+        *,
+        status: int | None = None,
+        priority: int | None = None,
+        tag: str | None = None,
+        type: str | None = None,
+        agent_id: int | None = None,
+        group_id: int | None = None,
+        created_after: str | None = None,
+        created_before: str | None = None,
+        updated_after: str | None = None,
+        updated_before: str | None = None,
+    ) -> dict:
         if status is not None:
             _positive_int(status, "status")
             if not 2 <= status <= 5:
@@ -493,13 +640,51 @@ class FreshdeskClient:
             _positive_int(priority, "priority")
             if not 1 <= priority <= 4:
                 raise ValueError("priority must be between 1 and 4")
+        if tag is not None:
+            if not isinstance(tag, str) or not _TAG_VALUE_RE.fullmatch(tag):
+                raise ValueError("tag contains invalid characters")
+        if type is not None:
+            if not isinstance(type, str) or not _TAG_VALUE_RE.fullmatch(type):
+                raise ValueError("type contains invalid characters")
+        if agent_id is not None:
+            agent_id = _positive_int(agent_id, "agent_id")
+        if group_id is not None:
+            group_id = _positive_int(group_id, "group_id")
+        if created_after is not None:
+            created_after = _validate_date(created_after, "created_after")
+        if created_before is not None:
+            created_before = _validate_date(created_before, "created_before")
+        if updated_after is not None:
+            updated_after = _validate_date(updated_after, "updated_after")
+        if updated_before is not None:
+            updated_before = _validate_date(updated_before, "updated_before")
+        if created_after is not None and created_before is not None and not (created_after < created_before):
+            raise ValueError("created_after must be before created_before")
+        if updated_after is not None and updated_before is not None and not (updated_after < updated_before):
+            raise ValueError("updated_after must be before updated_before")
         clauses = []
         if status is not None:
             clauses.append(f"status:{status}")
         if priority is not None:
             clauses.append(f"priority:{priority}")
+        if tag is not None:
+            clauses.append(f"tag:'{tag}'")
+        if type is not None:
+            clauses.append(f"type:'{type}'")
+        if agent_id is not None:
+            clauses.append(f"agent_id:{agent_id}")
+        if group_id is not None:
+            clauses.append(f"group_id:{group_id}")
+        if created_after is not None:
+            clauses.append(f"created_at:>'{created_after}'")
+        if created_before is not None:
+            clauses.append(f"created_at:<'{created_before}'")
+        if updated_after is not None:
+            clauses.append(f"updated_at:>'{updated_after}'")
+        if updated_before is not None:
+            clauses.append(f"updated_at:<'{updated_before}'")
         if not clauses:
-            raise ValueError("search requires at least one of status or priority")
+            raise ValueError("search requires at least one filter")
         query = f'"{" AND ".join(clauses)}"'
         results, truncated = self._search_paged(query)
         return {"results": results, "truncated": truncated}
