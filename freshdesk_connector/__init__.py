@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Any, Callable
 
-from .client import FreshdeskClient, FreshdeskWriteUncertainError
+from .client import FreshdeskClient, FreshdeskWriteUncertainError, canonical_time_spent
 
 REQUIRES_ENV = ["FRESHDESK_DOMAIN", "FRESHDESK_API_KEY"]
 
@@ -58,25 +59,252 @@ def _result(call: Callable[[], Any]) -> str:
         return json.dumps({"success": False, "error": str(exc), "error_type": type(exc).__name__})
 
 
-def _approval_hook(tool_name: str, args: dict | None = None, **_: Any):
-    if tool_name == "freshdesk_add_private_note":
-        ticket = (args or {}).get("ticket_id", "unknown")
-        return {
-            "action": "approve",
-            "message": f"Add a private note to Freshdesk ticket {ticket}",
-        }
+_STATUS_LABELS = {2: "Open", 3: "Pending", 4: "Resolved", 5: "Closed"}
+_PRIORITY_LABELS = {1: "Low", 2: "Medium", 3: "High", 4: "Urgent"}
+
+
+def _status_label(value: object) -> str:
+    if isinstance(value, bool) or type(value) is not int:
+        return "unrecognized"
+    if value in _STATUS_LABELS:
+        return f"{_STATUS_LABELS[value]} ({value})"
+    return f"{value} unrecognized"
+
+
+def _priority_label(value: object) -> str:
+    if isinstance(value, bool) or type(value) is not int:
+        return "unrecognized"
+    if value in _PRIORITY_LABELS:
+        return f"{_PRIORITY_LABELS[value]} ({value})"
+    return f"{value} unrecognized"
+
+
+def _excerpt(value: object, limit: int = 100) -> str:
+    if not isinstance(value, str):
+        return ""
+    cleaned = " ".join(value.split())
+    if len(cleaned) > limit:
+        return cleaned[: max(0, limit - 3)] + "..."
+    return cleaned
+
+
+def _preview_ticket(ticket_id: object):
+    """Return ``{subject, status, priority}`` for a ticket, or ``None``.
+
+    The default implementation reads through ``_client().get_ticket``. Tests may
+    monkeypatch this function to avoid the network. Any failure (missing
+    credentials, transport error, malformed response) is swallowed so a broken
+    preview never blocks the approval prompt.
+    """
+    try:
+        ticket = _client().get_ticket(ticket_id)
+    except Exception:
+        return None
+    if not isinstance(ticket, dict):
+        return None
+    return {
+        "subject": ticket.get("subject"),
+        "status": ticket.get("status"),
+        "priority": ticket.get("priority"),
+    }
+
+
+def _ticket_label(ticket_id: object) -> str:
+    if type(ticket_id) is int and ticket_id > 0:
+        return str(ticket_id)
+    return "invalid"
+
+
+def _id_label(value: object) -> str:
+    if type(value) is int and value > 0:
+        return str(value)
+    return "invalid"
+
+
+def _billable_label(value: object) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "invalid"
+
+
+def _duration_label(value: object) -> str:
+    try:
+        return canonical_time_spent(value)
+    except ValueError:
+        return "invalid"
+
+
+def _include_description_flag(value: object) -> bool:
+    return value is True
+
+
+def _format_from_to(label: str, current: object, proposed: object, label_fn) -> str:
+    current_text = "current value unavailable" if current is None else label_fn(current)
+    return f"{label}: {current_text} -> {label_fn(proposed)}"
+
+
+def _truncate_message(message: str, limit: int = 450) -> str:
+    if len(message) <= limit:
+        return message
+    return message[: max(0, limit - 3)] + "..."
+
+
+def _approval_relevant_args(tool_name: str, args: dict) -> dict:
+    args = args or {}
     if tool_name == "freshdesk_create_ticket":
-        return {
-            "action": "approve",
-            "message": "Create a new Freshdesk ticket",
-        }
-    return None
+        src = args.get("fields") if isinstance(args.get("fields"), dict) else {}
+    else:
+        src = args
+    return {
+        "tool": tool_name,
+        "ticket_id": src.get("ticket_id"),
+        "body": src.get("body"),
+        "subject": src.get("subject"),
+        "description": src.get("description"),
+        "email": src.get("email"),
+        "requester_id": src.get("requester_id"),
+        "status": src.get("status"),
+        "priority": src.get("priority"),
+        "time_spent": src.get("time_spent"),
+        "billable": src.get("billable"),
+        "note": src.get("note"),
+        "agent_id": src.get("agent_id"),
+    }
+
+
+def _rule_key(tool_name: str, args: dict) -> str:
+    payload = _approval_relevant_args(tool_name, args)
+    digest = hashlib.sha256(
+        json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    return f"{tool_name}:{digest[:16]}"
+
+
+def _approval_message_update_ticket(args: dict) -> str:
+    ticket_id = args.get("ticket_id")
+    current = _preview_ticket(ticket_id)
+    subject = _excerpt(current.get("subject")) if current else ""
+    header = f"Update Freshdesk ticket {_ticket_label(ticket_id)}"
+    if subject:
+        header = f"{header}: {subject}"
+    lines = [header]
+    if "status" in args:
+        cur = current.get("status") if current else None
+        lines.append(_format_from_to("status", cur, args["status"], _status_label))
+    if "priority" in args:
+        cur = current.get("priority") if current else None
+        lines.append(_format_from_to("priority", cur, args["priority"], _priority_label))
+    return "\n".join(lines)
+
+
+def _approval_message_add_private_note(args: dict) -> str:
+    ticket_id = args.get("ticket_id")
+    body = args.get("body")
+    current = _preview_ticket(ticket_id)
+    subject = _excerpt(current.get("subject")) if current else ""
+    header = f"Add a private note to Freshdesk ticket {_ticket_label(ticket_id)}"
+    if subject:
+        header = f"{header}: {subject}"
+    lines = [header]
+    if isinstance(body, str) and body.strip():
+        lines.append(f"Note: {_excerpt(body)}")
+    return "\n".join(lines)
+
+
+def _approval_message_reply_to_ticket(args: dict) -> str:
+    ticket_id = args.get("ticket_id")
+    body = args.get("body")
+    current = _preview_ticket(ticket_id)
+    subject = _excerpt(current.get("subject")) if current else ""
+    header = f"Freshdesk public reply to ticket {_ticket_label(ticket_id)}"
+    if subject:
+        header = f"{header}: {subject}"
+    lines = [header, "This emails the requester."]
+    if isinstance(body, str) and body.strip():
+        lines.append(f"Body: {_excerpt(body)}")
+    return "\n".join(lines)
+
+
+def _approval_message_create_ticket(args: dict) -> str:
+    fields = args.get("fields") if isinstance(args.get("fields"), dict) else {}
+    subject = _excerpt(fields.get("subject"))
+    description = _excerpt(fields.get("description"))
+    status = fields.get("status")
+    priority = fields.get("priority")
+    email = fields.get("email")
+    requester_id = fields.get("requester_id")
+    lines = ["Create a new Freshdesk ticket"]
+    if subject:
+        lines.append(f"Subject: {subject}")
+    if description:
+        lines.append(f"Description: {description}")
+    if status is not None:
+        lines.append(f"Status: {_status_label(status)}")
+    if priority is not None:
+        lines.append(f"Priority: {_priority_label(priority)}")
+    if isinstance(email, str) and email.strip():
+        lines.append(f"Requester (email): {_excerpt(email)}")
+    elif email not in (None, ""):
+        lines.append("Requester (email): invalid")
+    if requester_id is not None:
+        lines.append(f"Requester (id): {_id_label(requester_id)}")
+    return "\n".join(lines)
+
+
+def _approval_message_add_time_entry(args: dict) -> str:
+    ticket_id = args.get("ticket_id")
+    time_spent = args.get("time_spent")
+    billable = args.get("billable")
+    note = args.get("note")
+    agent_id = args.get("agent_id")
+    current = _preview_ticket(ticket_id)
+    subject = _excerpt(current.get("subject")) if current else ""
+    header = f"Freshdesk time entry for ticket {_ticket_label(ticket_id)}"
+    if subject:
+        header = f"{header}: {subject}"
+    lines = [header]
+    if time_spent is not None:
+        lines.append(f"Duration: {_duration_label(time_spent)}")
+    if billable is not None:
+        lines.append(f"Billable: {_billable_label(billable)}")
+    if isinstance(note, str) and note.strip():
+        lines.append(f"Note: {_excerpt(note)}")
+    if agent_id is not None:
+        lines.append(f"Agent: {_id_label(agent_id)}")
+    return "\n".join(lines)
+
+
+_APPROVAL_MESSAGES = {
+    "freshdesk_add_private_note": _approval_message_add_private_note,
+    "freshdesk_create_ticket": _approval_message_create_ticket,
+    "freshdesk_reply_to_ticket": _approval_message_reply_to_ticket,
+    "freshdesk_add_time_entry": _approval_message_add_time_entry,
+    "freshdesk_update_ticket": _approval_message_update_ticket,
+}
+
+
+def _approval_hook(tool_name: str, args: dict | None = None, **_: Any):
+    builder = _APPROVAL_MESSAGES.get(tool_name)
+    if builder is None:
+        return None
+    args = args or {}
+    try:
+        message = builder(args)
+    except Exception:
+        message = f"Approve {tool_name}"
+    return {
+        "action": "approve",
+        "message": _truncate_message(message),
+        "rule_key": _rule_key(tool_name, args),
+    }
 
 
 def _list_tickets(args: dict, **_: Any) -> str:
     return _result(lambda: _client().list_tickets(
         updated_since=args.get("updated_since", ""),
-        include_description=bool(args.get("include_description", False)),
+        include_description=_include_description_flag(args.get("include_description", False)),
     ))
 
 
@@ -125,13 +353,52 @@ def _create_ticket(args: dict, **_: Any) -> str:
     return _result(run)
 
 
+def _reply_to_ticket(args: dict, **_: Any) -> str:
+    def run():
+        return _client().reply_to_ticket(args.get("ticket_id"), args.get("body"))
+    return _result(run)
+
+
+def _add_time_entry(args: dict, **_: Any) -> str:
+    def run():
+        return _client().add_time_entry(
+            args.get("ticket_id"),
+            args.get("time_spent"),
+            args.get("note"),
+            args.get("billable"),
+            args.get("agent_id"),
+        )
+    return _result(run)
+
+
+def _update_ticket(args: dict, **_: Any) -> str:
+    def run():
+        return _client().update_ticket(
+            args.get("ticket_id"),
+            status=args.get("status"),
+            priority=args.get("priority"),
+        )
+    return _result(run)
+
+
 def _search_tickets(args: dict, **_: Any) -> str:
     def run():
         if "query" in args:
             raise ValueError("freshdesk_search_tickets does not accept a raw query argument")
+        for rejected in ("subject", "keyword"):
+            if rejected in args:
+                raise ValueError(f"freshdesk_search_tickets does not accept a {rejected} argument")
         return _client().search_tickets(
             status=args.get("status"),
             priority=args.get("priority"),
+            tag=args.get("tag"),
+            type=args.get("type"),
+            agent_id=args.get("agent_id"),
+            group_id=args.get("group_id"),
+            created_after=args.get("created_after"),
+            created_before=args.get("created_before"),
+            updated_after=args.get("updated_after"),
+            updated_before=args.get("updated_before"),
         )
 
     return _result(run)
@@ -153,6 +420,9 @@ def _schema(name: str, description: str, properties: dict, required: list[str]) 
 _ID = {"type": "integer", "minimum": 1}
 _PRIORITY = {"type": "integer", "minimum": 1, "maximum": 4}
 _STATUS = {"type": "integer", "minimum": 2, "maximum": 5}
+_TIME_SPENT = {"type": "string", "pattern": "^[0-9]{2,4}:[0-5][0-9]$"}
+_TAG_VALUE = {"type": "string", "pattern": "^[A-Za-z0-9 _-]{1,64}$"}
+_DATE_VALUE = {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"}
 
 _CREATE_FIELDS = {
     "type": "object",
@@ -195,9 +465,16 @@ _TOOLS = (
         "freshdesk_search_tickets",
         _schema(
             "freshdesk_search_tickets",
-            "Search Freshdesk tickets by status (2-5) and/or priority (1-4). "
+            "Search Freshdesk tickets by status (2-5), priority (1-4), tag, type, "
+            "agent_id, group_id, or created_at/updated_at date ranges. "
             "At least one filter is required. This is a read-only list operation.",
-            {"status": _STATUS, "priority": _PRIORITY},
+            {
+                "status": _STATUS, "priority": _PRIORITY,
+                "tag": _TAG_VALUE, "type": _TAG_VALUE,
+                "agent_id": _ID, "group_id": _ID,
+                "created_after": _DATE_VALUE, "created_before": _DATE_VALUE,
+                "updated_after": _DATE_VALUE, "updated_before": _DATE_VALUE,
+            },
             [],
         ),
         _search_tickets,
@@ -253,6 +530,42 @@ _TOOLS = (
             ["fields"],
         ),
         _create_ticket,
+    ),
+    (
+        "freshdesk_reply_to_ticket",
+        _schema(
+            "freshdesk_reply_to_ticket",
+            "Send a public reply to the requester of a Freshdesk ticket. Hermes requires human approval before execution.",
+            {"ticket_id": _ID, "body": {"type": "string"}},
+            ["ticket_id", "body"],
+        ),
+        _reply_to_ticket,
+    ),
+    (
+        "freshdesk_add_time_entry",
+        _schema(
+            "freshdesk_add_time_entry",
+            "Add a finished time entry to a Freshdesk ticket. Hermes requires human approval before execution.",
+            {
+                "ticket_id": _ID,
+                "time_spent": _TIME_SPENT,
+                "note": {"type": "string"},
+                "billable": {"type": "boolean"},
+                "agent_id": _ID,
+            },
+            ["ticket_id", "time_spent", "note", "billable"],
+        ),
+        _add_time_entry,
+    ),
+    (
+        "freshdesk_update_ticket",
+        _schema(
+            "freshdesk_update_ticket",
+            "Update a Freshdesk ticket's status (2-5) and/or priority (1-4). Hermes requires human approval before execution.",
+            {"ticket_id": _ID, "status": _STATUS, "priority": _PRIORITY},
+            ["ticket_id"],
+        ),
+        _update_ticket,
     ),
 )
 
