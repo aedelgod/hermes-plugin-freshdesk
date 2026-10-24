@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable
 
-from .client import FreshdeskClient, FreshdeskWriteUncertainError
+from .client import FreshdeskClient, FreshdeskWriteUncertainError, canonical_time_spent
 
 REQUIRES_ENV = ["FRESHDESK_DOMAIN", "FRESHDESK_API_KEY"]
 
@@ -64,16 +64,16 @@ _PRIORITY_LABELS = {1: "Low", 2: "Medium", 3: "High", 4: "Urgent"}
 
 
 def _status_label(value: object) -> str:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return f"{value} unrecognized"
+    if isinstance(value, bool) or type(value) is not int:
+        return "unrecognized"
     if value in _STATUS_LABELS:
         return f"{_STATUS_LABELS[value]} ({value})"
     return f"{value} unrecognized"
 
 
 def _priority_label(value: object) -> str:
-    if isinstance(value, bool) or not isinstance(value, int):
-        return f"{value} unrecognized"
+    if isinstance(value, bool) or type(value) is not int:
+        return "unrecognized"
     if value in _PRIORITY_LABELS:
         return f"{_PRIORITY_LABELS[value]} ({value})"
     return f"{value} unrecognized"
@@ -107,6 +107,37 @@ def _preview_ticket(ticket_id: object):
         "status": ticket.get("status"),
         "priority": ticket.get("priority"),
     }
+
+
+def _ticket_label(ticket_id: object) -> str:
+    if type(ticket_id) is int and ticket_id > 0:
+        return str(ticket_id)
+    return "invalid"
+
+
+def _id_label(value: object) -> str:
+    if type(value) is int and value > 0:
+        return str(value)
+    return "invalid"
+
+
+def _billable_label(value: object) -> str:
+    if value is True:
+        return "yes"
+    if value is False:
+        return "no"
+    return "invalid"
+
+
+def _duration_label(value: object) -> str:
+    try:
+        return canonical_time_spent(value)
+    except ValueError:
+        return "invalid"
+
+
+def _include_description_flag(value: object) -> bool:
+    return value is True
 
 
 def _format_from_to(label: str, current: object, proposed: object, label_fn) -> str:
@@ -155,7 +186,7 @@ def _approval_message_update_ticket(args: dict) -> str:
     ticket_id = args.get("ticket_id")
     current = _preview_ticket(ticket_id)
     subject = _excerpt(current.get("subject")) if current else ""
-    header = f"Update Freshdesk ticket {ticket_id}"
+    header = f"Update Freshdesk ticket {_ticket_label(ticket_id)}"
     if subject:
         header = f"{header}: {subject}"
     lines = [header]
@@ -173,7 +204,7 @@ def _approval_message_add_private_note(args: dict) -> str:
     body = args.get("body")
     current = _preview_ticket(ticket_id)
     subject = _excerpt(current.get("subject")) if current else ""
-    header = f"Add a private note to Freshdesk ticket {ticket_id}"
+    header = f"Add a private note to Freshdesk ticket {_ticket_label(ticket_id)}"
     if subject:
         header = f"{header}: {subject}"
     lines = [header]
@@ -187,7 +218,7 @@ def _approval_message_reply_to_ticket(args: dict) -> str:
     body = args.get("body")
     current = _preview_ticket(ticket_id)
     subject = _excerpt(current.get("subject")) if current else ""
-    header = f"Freshdesk public reply to ticket {ticket_id}"
+    header = f"Freshdesk public reply to ticket {_ticket_label(ticket_id)}"
     if subject:
         header = f"{header}: {subject}"
     lines = [header, "This emails the requester."]
@@ -207,16 +238,18 @@ def _approval_message_create_ticket(args: dict) -> str:
     lines = ["Create a new Freshdesk ticket"]
     if subject:
         lines.append(f"Subject: {subject}")
-    if email:
-        lines.append(f"Requester (email): {email}")
-    if requester_id is not None:
-        lines.append(f"Requester (id): {requester_id}")
+    if description:
+        lines.append(f"Description: {description}")
     if status is not None:
         lines.append(f"Status: {_status_label(status)}")
     if priority is not None:
         lines.append(f"Priority: {_priority_label(priority)}")
-    if description:
-        lines.append(f"Description: {description}")
+    if isinstance(email, str) and email.strip():
+        lines.append(f"Requester (email): {_excerpt(email)}")
+    elif email not in (None, ""):
+        lines.append("Requester (email): invalid")
+    if requester_id is not None:
+        lines.append(f"Requester (id): {_id_label(requester_id)}")
     return "\n".join(lines)
 
 
@@ -228,18 +261,18 @@ def _approval_message_add_time_entry(args: dict) -> str:
     agent_id = args.get("agent_id")
     current = _preview_ticket(ticket_id)
     subject = _excerpt(current.get("subject")) if current else ""
-    header = f"Freshdesk time entry for ticket {ticket_id}"
+    header = f"Freshdesk time entry for ticket {_ticket_label(ticket_id)}"
     if subject:
         header = f"{header}: {subject}"
     lines = [header]
     if time_spent is not None:
-        lines.append(f"Duration: {time_spent}")
+        lines.append(f"Duration: {_duration_label(time_spent)}")
     if billable is not None:
-        lines.append(f"Billable: {'yes' if billable else 'no'}")
+        lines.append(f"Billable: {_billable_label(billable)}")
     if isinstance(note, str) and note.strip():
         lines.append(f"Note: {_excerpt(note)}")
     if agent_id is not None:
-        lines.append(f"Agent: {agent_id}")
+        lines.append(f"Agent: {_id_label(agent_id)}")
     return "\n".join(lines)
 
 
@@ -271,7 +304,7 @@ def _approval_hook(tool_name: str, args: dict | None = None, **_: Any):
 def _list_tickets(args: dict, **_: Any) -> str:
     return _result(lambda: _client().list_tickets(
         updated_since=args.get("updated_since", ""),
-        include_description=bool(args.get("include_description", False)),
+        include_description=_include_description_flag(args.get("include_description", False)),
     ))
 
 

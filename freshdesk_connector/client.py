@@ -57,7 +57,54 @@ _CDN_S3_HOST_RE = re.compile(r"^cdn\.freshdesk\.com\.s3(\.[a-z0-9-]+)?\.amazonaw
 _CERTAIN_FAILURE_STATUS = frozenset({400, 401, 403, 404, 409, 422})
 _MAX_SEARCH_PAGES = 10
 _TAG_VALUE_RE = re.compile(r"^[A-Za-z0-9 _-]{1,64}$")
-_TIME_SPENT_RE = re.compile(r"^[0-9]{2,4}:[0-5][0-9]$")
+_TIME_SPENT_RE = re.compile(r"^([0-9]{1,4}):([0-5][0-9])$")
+_BR_RE = re.compile(r"(?i)<br\s*/?>")
+_CLOSE_DIV_RE = re.compile(r"(?i)</div>")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def canonical_time_spent(value: object) -> str:
+    """Return the HH:MM form Freshdesk stores, or reject the value."""
+    if not isinstance(value, str):
+        raise ValueError("time_spent must be H:MM through HHHH:MM")
+    match = _TIME_SPENT_RE.fullmatch(value)
+    if match is None:
+        raise ValueError("time_spent must be H:MM through HHHH:MM")
+    hours = int(match.group(1))
+    minutes = int(match.group(2))
+    if hours == 0 and minutes == 0:
+        raise ValueError("time_spent must not be zero")
+    if hours < 100:
+        return f"{hours:02d}:{minutes:02d}"
+    return f"{hours}:{minutes:02d}"
+
+
+def _html_div(text: str) -> str:
+    return "<div>" + html.escape(text).replace("\n", "<br>") + "</div>"
+
+
+def _plain_text(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _plain_from_html(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    text = _BR_RE.sub("\n", value)
+    text = _CLOSE_DIV_RE.sub("\n", text)
+    text = _HTML_TAG_RE.sub("", text)
+    return _plain_text(html.unescape(text))
+
+
+def _conversation_plain(item: object) -> str:
+    if not isinstance(item, dict):
+        return ""
+    body_text = item.get("body_text")
+    if isinstance(body_text, str) and body_text.strip():
+        return _plain_text(body_text)
+    return _plain_from_html(item.get("body"))
 _DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
 
 
@@ -315,6 +362,19 @@ class FreshdeskClient:
         ticket_id = _positive_int(ticket_id, "ticket_id")
         return self._paged(f"/api/v2/tickets/{ticket_id}/conversations")
 
+    def _find_conversation(self, ticket_id: int, conversation_id: int) -> dict:
+        path = f"/api/v2/tickets/{ticket_id}/conversations"
+        for page in range(1, self._max_pages + 1):
+            value = self._json("GET", path, query={"page": page, "per_page": self._per_page})
+            if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+                raise FreshdeskError("Freshdesk returned an invalid list response")
+            for item in value:
+                if item.get("id") == conversation_id:
+                    return item
+            if len(value) < self._per_page:
+                raise FreshdeskError("conversation readback is missing")
+        raise FreshdeskError("conversation readback is missing")
+
     def get_contact(self, contact_id: int) -> dict:
         contact_id = _positive_int(contact_id, "contact_id")
         value = self._json("GET", f"/api/v2/contacts/{contact_id}")
@@ -377,9 +437,10 @@ class FreshdeskClient:
         name = attachment.get("name")
         if not isinstance(url, str) or not isinstance(name, str) or not name.strip():
             raise FreshdeskError("attachment URL and name are required")
-        safe_name = Path(name).name
-        if safe_name in ("", ".", ".."):
-            raise ValueError("attachment filename is invalid")
+        leaf = Path(name).name
+        if leaf in ("", ".", ".."):
+            leaf = "attachment.bin"
+        safe_name = f"{attachment_id}-{leaf}"
         kind = self._classify_attachment_url(url)
         body = self._request(
             "GET", url, authenticated=(kind == "freshdesk"), limit=self._max_attachment_bytes
@@ -416,7 +477,7 @@ class FreshdeskClient:
         if not isinstance(body, str) or not body.strip():
             raise ValueError("body is required")
         clean_body = body.strip()
-        html_body = f"<div>{html.escape(clean_body).replace(chr(10), '<br>')}</div>"
+        html_body = _html_div(clean_body)
         try:
             created = self._json(
                 "POST", f"/api/v2/tickets/{ticket_id}/notes",
@@ -434,15 +495,10 @@ class FreshdeskClient:
             )
         note_id = created["id"]
         try:
-            matches = [item for item in self.list_conversations(ticket_id) if item.get("id") == note_id]
-            if (
-                len(matches) != 1
-                or matches[0].get("private") is not True
-                or str(matches[0].get("body_text", "")).replace("\r\n", "\n").strip()
-                != clean_body.replace("\r\n", "\n")
-            ):
+            match = self._find_conversation(ticket_id, note_id)
+            if match.get("private") is not True or _conversation_plain(match) != _plain_text(clean_body):
                 raise FreshdeskError("private note readback did not match")
-            return matches[0]
+            return match
         except Exception as exc:
             raise FreshdeskWriteUncertainError("private-note write", note_id, exc) from exc
 
@@ -477,7 +533,12 @@ class FreshdeskClient:
         unsupported = sorted(set(fields) - allowed)
         if unsupported:
             raise ValueError(f"unsupported fields: {', '.join(unsupported)}")
+        description = fields.get("description")
+        if not isinstance(description, str) or not description.strip():
+            raise ValueError("description is required")
+        plain_description = description.strip()
         sent = dict(fields)
+        sent["description"] = _html_div(plain_description)
         try:
             created = self._json("POST", "/api/v2/tickets", payload=sent)
         except FreshdeskHttpError as exc:
@@ -493,7 +554,9 @@ class FreshdeskClient:
         ticket_id = created["id"]
         try:
             readback = self.get_ticket(ticket_id, include="requester")
-            self._verify_create_readback(sent, readback)
+            verified = dict(sent)
+            verified["description"] = plain_description
+            self._verify_create_readback(verified, readback)
             return readback
         except Exception as exc:
             raise FreshdeskWriteUncertainError("ticket creation", ticket_id, exc) from exc
@@ -503,7 +566,7 @@ class FreshdeskClient:
         if not isinstance(body, str) or not body.strip():
             raise ValueError("body is required")
         clean_body = body.strip()
-        html_body = f"<div>{html.escape(clean_body).replace(chr(10), '<br>')}</div>"
+        html_body = _html_div(clean_body)
         try:
             created = self._json(
                 "POST", f"/api/v2/tickets/{ticket_id}/reply",
@@ -521,17 +584,14 @@ class FreshdeskClient:
             )
         conv_id = created["id"]
         try:
-            conversations = self.list_conversations(ticket_id)
-            matches = [item for item in conversations if item.get("id") == conv_id]
+            match = self._find_conversation(ticket_id, conv_id)
             if (
-                len(matches) != 1
-                or matches[0].get("private") is not False
-                or matches[0].get("incoming") is not False
-                or str(matches[0].get("body_text", "")).replace("\r\n", "\n").strip()
-                != clean_body.replace("\r\n", "\n")
+                match.get("private") is not False
+                or match.get("incoming") is not False
+                or _conversation_plain(match) != _plain_text(clean_body)
             ):
                 raise FreshdeskError("reply readback did not match")
-            return matches[0]
+            return match
         except Exception as exc:
             raise FreshdeskWriteUncertainError("reply write", conv_id, exc) from exc
 
@@ -539,12 +599,10 @@ class FreshdeskClient:
         self, ticket_id: int, time_spent: str, note: str, billable: bool, agent_id: int | None = None
     ) -> dict:
         ticket_id = _positive_int(ticket_id, "ticket_id")
-        if not isinstance(time_spent, str) or not _TIME_SPENT_RE.fullmatch(time_spent):
-            raise ValueError("time_spent must be formatted as HH:MM with at least two hour digits")
-        if time_spent == "00:00":
-            raise ValueError("time_spent must not be zero")
+        time_spent = canonical_time_spent(time_spent)
         if not isinstance(note, str) or not note.strip():
             raise ValueError("note is required")
+        note = note.strip()
         if type(billable) is not bool:
             raise ValueError("billable must be a boolean")
         if agent_id is not None:

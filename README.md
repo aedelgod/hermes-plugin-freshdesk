@@ -16,12 +16,12 @@ carries no tenant configuration, credentials, or ticket data.
 - `freshdesk_get_contact` — fetch one contact by ID.
 - `freshdesk_download_attachment` — resolve an attachment by ticket and attachment ID, then download it from the Freshdesk CDN/S3 origin to the Hermes cache. No caller-controlled URL.
 - `freshdesk_add_private_note` — write a plain-text private note (HTML-escaped), then verify it through conversations.
-- `freshdesk_create_ticket` — create a basic ticket, then verify every submitted field by fetching the new ticket.
-- `freshdesk_reply_to_ticket` — send a public reply to the requester of a ticket.
-- `freshdesk_add_time_entry` — add a finished (non-timer) time entry to a ticket. `time_spent` must be `HH:MM` with at least two hour digits (`00:01`), not `H:MM` (`0:01`).
+- `freshdesk_create_ticket` — create a basic ticket from plain text. The description is HTML-escaped before it is sent, then verified against `description_text`.
+- `freshdesk_reply_to_ticket` — send a public reply to the requester of a ticket. The approval Reason includes the reply text.
+- `freshdesk_add_time_entry` — add a finished (non-timer) time entry. Callers may pass `H:MM` through `HHHH:MM`; the client stores the form Freshdesk keeps (`1:30` and `000:01` are sent as `01:30` and `00:01`). Zero is rejected, including padded zeros.
 - `freshdesk_update_ticket` — update a ticket's `status` (2-5) and/or `priority` (1-4).
 
-The five write tools (`freshdesk_add_private_note`, `freshdesk_create_ticket`, `freshdesk_reply_to_ticket`, `freshdesk_add_time_entry`, and `freshdesk_update_ticket`) register a `pre_tool_call` hook that escalates execution to Hermes' trusted human-approval gate. The language model cannot satisfy this gate with an ordinary tool argument, and unattended contexts without an approval bridge fail closed. The approval Reason line names the affected ticket and the proposed change; for `freshdesk_update_ticket` it shows the current and proposed status or priority, and for `freshdesk_create_ticket` it shows the requester, status label, and priority label.
+The five write tools (`freshdesk_add_private_note`, `freshdesk_create_ticket`, `freshdesk_reply_to_ticket`, `freshdesk_add_time_entry`, and `freshdesk_update_ticket`) register a `pre_tool_call` hook that escalates execution to Hermes' trusted human-approval gate. The language model cannot satisfy this gate with an ordinary tool argument, and unattended contexts without an approval bridge fail closed. The approval Reason reads back the change that will be written: the reply or note text, the description, the canonical duration, and the status or priority from-to line. A newline in a field is collapsed, so it cannot hide that change. Hermes still owns the human gate, and the headline remains the tool name.
 
 ## Configuration
 
@@ -64,7 +64,7 @@ python3 -m unittest discover -s tests -v
 - Attachment downloads are resolved only from a ticket's own attachment objects (the ticket, then its conversations); no caller-supplied URL is ever fetched.
 - Attachment URLs are accepted only from Freshdesk's same-origin attachment path (`/helpdesk/attachments/`), `attachment.freshdesk.com`, hosts matching `[a-z0-9-]+-attachment.freshdesk.com`, `s3.amazonaws.com/cdn.freshdesk.com/`, and `cdn.freshdesk.com.s3*.amazonaws.com`. Dummy signatures on any other S3 bucket are rejected.
 - The Freshdesk Authorization header is sent only to the same-origin attachment path; it is never sent to the Freshdesk CDN or to S3.
-- Attachment filenames are reduced to their basename, created mode `0600`, exclusively and without following symlinks, inside a directory opened component-by-component without symlink traversal.
+- Attachment filenames are reduced to their basename, prefixed with the attachment id, created mode `0600`, exclusively and without following symlinks, inside a directory opened component-by-component without symlink traversal.
 - Write tools pass through Hermes' human-approval gate and are read back before success is returned.
 - No automatic retries of POST requests. Ambiguous writes return `state=write_may_have_succeeded` with `created_id` when known and `retry_safe=false`; definite rejections (HTTP 400/401/403/404/409/422) return a plain failure.
 

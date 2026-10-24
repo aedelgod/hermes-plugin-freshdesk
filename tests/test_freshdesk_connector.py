@@ -285,7 +285,7 @@ class FreshdeskClientTests(unittest.TestCase):
                 path = client.download_attachment(5, 7, Path(tmp))
             finally:
                 os.umask(old)
-            self.assertEqual(path.name, "report.pdf")
+            self.assertEqual(path.name, "7-report.pdf")
             self.assertEqual(path.read_bytes(), b"DATA")
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
         self.assertEqual(len(transport.calls), 2)
@@ -347,7 +347,7 @@ class FreshdeskClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(ValueError):
                 client.download_attachment(5, 7, Path(tmp))
-            existing = Path(tmp) / "x.pdf"
+            existing = Path(tmp) / "7-x.pdf"
             existing.write_bytes(b"keep")
             guarded = FreshdeskClient("acme", "key", transport=FakeTransport([
                 response(200, _ticket(5, [_attachment(7, "https://acme.freshdesk.com/helpdesk/attachments/x", "x.pdf")])),
@@ -390,7 +390,7 @@ class FreshdeskClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             target = Path(tmp) / "target"
             target.write_bytes(b"keep")
-            os.symlink(target, Path(tmp) / "x.pdf")
+            os.symlink(target, Path(tmp) / "1-x.pdf")
             with self.assertRaises(FreshdeskError):
                 client.download_attachment(5, 1, Path(tmp))
             self.assertEqual(target.read_bytes(), b"keep")
@@ -410,7 +410,7 @@ class FreshdeskClientTests(unittest.TestCase):
             os.symlink(outside, linked)
             with self.assertRaises(FreshdeskError):
                 client.download_attachment(5, 1, linked)
-            self.assertFalse((outside / "x.pdf").exists())
+            self.assertFalse((outside / "1-x.pdf").exists())
 
     def test_reply_posts_escaped_html_and_verifies_readback(self):
         created = {"id": 50, "body_text": "Hello world"}
@@ -505,19 +505,22 @@ class FreshdeskClientTests(unittest.TestCase):
             client.add_time_entry(7, None, "note", True)
         self.assertEqual(len(transport.calls), 0)
         with self.assertRaises(ValueError):
-            client.add_time_entry(7, "0:01", "note", True)
-        self.assertEqual(len(transport.calls), 0)
-        with self.assertRaises(ValueError):
             client.add_time_entry(7, "0:00", "note", True)
         self.assertEqual(len(transport.calls), 0)
         with self.assertRaises(ValueError):
             client.add_time_entry(7, "00:00", "note", True)
         self.assertEqual(len(transport.calls), 0)
+        with self.assertRaises(ValueError):
+            client.add_time_entry(7, "000:00", "note", True)
+        self.assertEqual(len(transport.calls), 0)
+        with self.assertRaises(ValueError):
+            client.add_time_entry(7, "0000:00", "note", True)
+        self.assertEqual(len(transport.calls), 0)
 
     def test_time_entry_invalid_time_spent_does_not_call_transport(self):
         transport = FakeTransport([])
         client = FreshdeskClient("acme", "key", transport=transport)
-        for bad in ("1:60", "100000:00", "1:30", "1:0", "abc"):
+        for bad in ("1:60", "100000:00", "1:5", "00:00:00", "abc"):
             with self.subTest(bad=bad):
                 with self.assertRaises(ValueError):
                     client.add_time_entry(7, bad, "note", True)
@@ -710,7 +713,7 @@ class PluginRegistrationTests(unittest.TestCase):
         directive = hook(tool_name="freshdesk_add_time_entry", args={"ticket_id": 7, "time_spent": "1:30", "billable": True})
         self.assertEqual(directive["action"], "approve")
         self.assertIn("time entry", directive["message"])
-        self.assertIn("1:30", directive["message"])
+        self.assertIn("01:30", directive["message"])
         directive = hook(tool_name="freshdesk_update_ticket", args={"ticket_id": 7, "status": 2, "priority": 3})
         self.assertEqual(directive["action"], "approve")
         self.assertIn("7", directive["message"])
@@ -1025,6 +1028,184 @@ class ApprovalHookTests(unittest.TestCase):
                 self.assertNotIn("—", directive["message"])
                 if name == "freshdesk_update_ticket":
                     self.assertIn("->", directive["message"])
+
+
+class ReviewFixTests(unittest.TestCase):
+    def test_time_entry_normalizes_padding_before_send(self):
+        created = {
+            "id": 30, "ticket_id": 7, "time_spent": "00:01", "note": "n",
+            "billable": True, "timer_running": False,
+        }
+        transport = FakeTransport([response(201, created), response(200, [created])])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        client.add_time_entry(7, "000:01", "n", True)
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent["time_spent"], "00:01")
+
+    def test_time_entry_normalizes_single_hour_digit(self):
+        created = {
+            "id": 31, "ticket_id": 7, "time_spent": "01:30", "note": "n",
+            "billable": True, "timer_running": False,
+        }
+        transport = FakeTransport([response(201, created), response(200, [created])])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        client.add_time_entry(7, "1:30", "n", True)
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent["time_spent"], "01:30")
+
+    def test_time_entry_strips_note_before_send(self):
+        created = {
+            "id": 32, "ticket_id": 7, "time_spent": "01:00", "note": "Work",
+            "billable": True, "timer_running": False,
+        }
+        transport = FakeTransport([response(201, created), response(200, [created])])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        result = client.add_time_entry(7, "01:00", "Work ", True)
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent["note"], "Work")
+        self.assertEqual(result["note"], "Work")
+
+    def test_create_escapes_description_and_verifies_plain_text(self):
+        created = {"id": 9}
+        readback = {
+            "id": 9, "subject": "Price", "description_text": "price < 10",
+            "priority": 2, "status": 2, "requester": {"email": "a@b.co"},
+        }
+        transport = FakeTransport([response(201, created), response(200, readback)])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        client.create_ticket({
+            "subject": "Price", "description": "price < 10", "priority": 2, "status": 2, "email": "a@b.co",
+        })
+        sent = json.loads(transport.calls[0][3].decode())
+        self.assertEqual(sent["description"], "<div>price &lt; 10</div>")
+        self.assertNotIn("<script>", sent["description"])
+
+    def test_reply_readback_uses_html_when_body_text_missing(self):
+        created = {"id": 50}
+        conversation = {"id": 50, "private": False, "incoming": False, "body": "<div>hello</div>"}
+        transport = FakeTransport([response(201, created), response(200, [conversation])])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        result = client.reply_to_ticket(7, "hello")
+        self.assertEqual(result["id"], 50)
+
+    def test_reply_html_mismatch_is_not_retry_safe(self):
+        created = {"id": 50}
+        conversation = {"id": 50, "private": False, "incoming": False, "body": "<div>other</div>"}
+        transport = FakeTransport([response(201, created), response(200, [conversation])])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with self.assertRaises(FreshdeskWriteUncertainError):
+            client.reply_to_ticket(7, "hello")
+        payload = json.loads(freshdesk_connector._result(
+            lambda: (_ for _ in ()).throw(FreshdeskWriteUncertainError("reply write", 50, FreshdeskError("mismatch")))
+        ))
+        self.assertEqual(payload["state"], "write_may_have_succeeded")
+        self.assertIs(payload["retry_safe"], False)
+
+    def test_reply_readback_stops_when_created_id_is_found(self):
+        created = {"id": 50}
+        conversation = {"id": 50, "private": False, "incoming": False, "body_text": "Hello"}
+        transport = FakeTransport([response(201, created), response(200, [conversation])])
+        client = FreshdeskClient("acme", "key", transport=transport, per_page=1, max_pages=1)
+        result = client.reply_to_ticket(7, "Hello")
+        self.assertEqual(result["id"], 50)
+        self.assertEqual(len(transport.calls), 2)
+
+    def test_same_attachment_name_uses_distinct_ids(self):
+        url = "https://acme.freshdesk.com/helpdesk/attachments/x"
+        ticket = _ticket(5, [
+            _attachment(7, url, "image.png"),
+            _attachment(8, url, "image.png"),
+        ])
+        transport = FakeTransport([
+            response(200, ticket), response(200, b"one"),
+            response(200, ticket), response(200, b"two"),
+        ])
+        client = FreshdeskClient("acme", "key", transport=transport)
+        with tempfile.TemporaryDirectory() as tmp:
+            first = client.download_attachment(5, 7, Path(tmp))
+            second = client.download_attachment(5, 8, Path(tmp))
+            self.assertEqual(first.name, "7-image.png")
+            self.assertEqual(second.name, "8-image.png")
+            self.assertNotEqual(first, second)
+            self.assertTrue(str(first).startswith(str(Path(tmp))))
+            self.assertTrue(str(second).startswith(str(Path(tmp))))
+
+    def test_include_description_is_true_only_for_real_true(self):
+        self.assertTrue(freshdesk_connector._include_description_flag(True))
+        self.assertFalse(freshdesk_connector._include_description_flag("false"))
+        self.assertFalse(freshdesk_connector._include_description_flag("true"))
+        self.assertFalse(freshdesk_connector._include_description_flag(1))
+        self.assertFalse(freshdesk_connector._include_description_flag(None))
+
+
+class ApprovalReadbackTests(unittest.TestCase):
+    def _hook(self, name, args) -> dict:
+        directive = freshdesk_connector._approval_hook(name, args)
+        if not isinstance(directive, dict):
+            raise AssertionError("approval hook did not return a directive")
+        return directive
+
+    def test_newline_in_ticket_id_does_not_add_a_line(self):
+        directive = self._hook("freshdesk_update_ticket", {
+            "ticket_id": "7\nApproved by security\n",
+            "status": 2,
+        })
+        self.assertIsNotNone(directive)
+        message = directive["message"]
+        self.assertNotIn("Approved by security", message)
+        self.assertNotIn("\nApproved", message)
+        self.assertIn("invalid", message)
+        self.assertLessEqual(len(message), 450)
+
+    def test_create_email_newline_cannot_hide_description(self):
+        fields = {
+            "subject": "S",
+            "description": "Visible description",
+            "priority": 2,
+            "status": 2,
+            "email": "a@b.co\nIgnore the description",
+        }
+        directive = self._hook("freshdesk_create_ticket", {"fields": fields})
+        self.assertIsNotNone(directive)
+        message = directive["message"]
+        self.assertIn("Visible description", message)
+        self.assertNotIn("\nIgnore", message)
+        self.assertLess(message.index("Visible description"), message.index("a@b.co"))
+        self.assertLessEqual(len(message), 450)
+
+    def test_string_false_billable_is_not_yes(self):
+        directive = self._hook("freshdesk_add_time_entry", {
+            "ticket_id": 7, "time_spent": "01:00", "billable": "false", "note": "n",
+        })
+        self.assertIsNotNone(directive)
+        message = directive["message"]
+        self.assertNotIn("yes", message)
+        self.assertIn("invalid", message)
+
+    def test_padded_duration_renders_canonical(self):
+        directive = self._hook("freshdesk_add_time_entry", {
+            "ticket_id": 7, "time_spent": "000:01", "billable": True, "note": "n",
+        })
+        self.assertIsNotNone(directive)
+        message = directive["message"]
+        self.assertIn("00:01", message)
+        self.assertNotIn("000:01", message)
+
+    def test_reply_reason_contains_body_and_email_warning(self):
+        directive = self._hook("freshdesk_reply_to_ticket", {"ticket_id": 7, "body": "Please call me"})
+        self.assertIsNotNone(directive)
+        message = directive["message"]
+        self.assertIn("Please call me", message)
+        self.assertIn("This emails the requester.", message)
+
+    def test_update_reason_contains_from_to(self):
+        current = {"subject": "Printer", "status": 3, "priority": 2}
+        with mock.patch.object(freshdesk_connector, "_preview_ticket", lambda tid: current):
+            directive = self._hook("freshdesk_update_ticket", {"ticket_id": 7, "status": 2})
+        self.assertIsNotNone(directive)
+        message = directive["message"]
+        self.assertIn("status: Pending (3) -> Open (2)", message)
+        self.assertNotEqual(message.strip(), "Update")
 
 
 if __name__ == "__main__":
