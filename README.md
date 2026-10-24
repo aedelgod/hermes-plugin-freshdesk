@@ -1,6 +1,8 @@
 # Freshdesk connector for Hermes Agent
 
-**Author:** GFORGOV®. Copyright (c) 2026 GFORGOV®. Released under the MIT License.
+**Author:** GFORGOV®. Released under the MIT License.
+
+See [CHANGELOG.md](CHANGELOG.md) for the 0.2.0 changes.
 
 A dependency-free directory plugin that exposes Freshdesk API v2 tools to Hermes
 Agent. It performs bounded pagination, bounded downloads, strict origin checks,
@@ -35,17 +37,31 @@ FRESHDESK_API_KEY=your-api-key
 
 `FRESHDESK_DOMAIN` accepts either `your-account` or `https://your-account.freshdesk.com`. Custom support CNAMEs are rejected because credentials must only be sent to a native Freshdesk HTTPS origin. The plugin reads these through Hermes' profile secret scope, so they are never read directly from the process environment by plugin code.
 
-## Install as a user plugin
+## Install
 
-Copy this directory into the active Hermes profile:
+Install the plugin from the Hermes curated catalog:
 
 ```bash
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-mkdir -p "$HERMES_HOME/plugins"
-cp -R . "$HERMES_HOME/plugins/freshdesk"
+hermes plugins install freshdesk
 ```
 
-Restart the relevant Hermes process so plugin discovery runs again.
+The install prompt asks whether to enable the plugin now; if you answer no,
+run `hermes plugins enable freshdesk` afterward, or pass `--enable` to answer
+the prompt automatically in a script.
+
+## Update
+
+Check for a newer catalog pin, then move the install to it:
+
+```bash
+hermes plugins check-updates
+hermes plugins update freshdesk
+```
+
+`hermes plugins update freshdesk` compares the installed catalog pin to the
+current reviewed catalog pin. It does not git-pull this repository; a newer
+catalog pin is required before the update moves the install, and the plugin's
+enabled state is preserved.
 
 ## Tests
 
